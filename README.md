@@ -65,8 +65,6 @@ This is a **×4 super-resolution reconstruction network** specifically targeting
 
 ### Download & Use
 
-> 🔄 **Coming soon** — Application packaging is in progress. Download links will be added here once the first Release is published.
-
 Releases are split into two separate packages — download both from [Releases](https://github.com/yumenana/Caelum/releases):
 
 | Package | Contents |
