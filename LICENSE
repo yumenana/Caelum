@@ -1,0 +1,46 @@
+﻿Caelum — Dual License
+
+Copyright (c) 2025 yumenana
+
+This project uses a dual licensing model:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Part 1 — Network Architecture & Training Source Code  →  AGPL-3.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Applies to the following published source files:
+
+  PPBUNet_v1_x4.py  modules.py  hat.py  ps_mamba.py
+  train.py
+
+Licensed under the GNU Affero General Public License v3.0.
+Full text: https://www.gnu.org/licenses/agpl-3.0.html
+See also: LICENSE-AGPL-3.0
+
+Key points:
+  - You may use, modify, and distribute freely.
+  - Any derivative work must be released under AGPL-3.0.
+  - If you run this code as a network service, you must
+    make the complete source code available to users.
+  - Commercial use is permitted under these terms.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Part 2 — Training Code, Model & Application  →  CC BY-NC-SA 4.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Applies to the following published files:
+
+  dataset.py  losses.py
+  and all model / application release files (*.onnx, Caelum.exe).
+
+Licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0.
+Full text: https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
+
+Key points:
+  - NonCommercial: You may NOT use this material for commercial purposes.
+  - ShareAlike: Derivatives must be distributed under the same license.
+  - Attribution: You must credit the original author (yumenana / Caelum).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Commercial Licensing
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+For commercial use of training code or model weights, please
+contact the author for a separate commercial license agreement.
