@@ -390,3 +390,7 @@ FodyWeavers.xsd
 !/Caelum/model/PPBUnet_v1/ps_mamba.py
 !/Caelum/model/PPBUnet_v1/losses.py
 !/Caelum/model/PPBUnet_v1/ARCHITECTURE.md
+
+# 资源文件
+!/Caelum/assets/*
+!/Caelum/assets/*/*
