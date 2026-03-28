@@ -371,6 +371,9 @@ FodyWeavers.xsd
 # 允许递归进入目录
 !*/
 
+# 允许跟踪特定文件
+!/.github/*
+
 # README 文件
 !/README.md
 !/README_zh.md
