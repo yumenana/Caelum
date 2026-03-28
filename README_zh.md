@@ -1,4 +1,4 @@
-[English](README.md) | **中文**
+﻿[English](README.md) | **中文**
 
 <div align="center">
 
@@ -64,8 +64,6 @@
 ## 🚀 快速开始
 
 ### 下载与使用
-
-> 🔄 **Coming soon** — 应用程序正在打包中，第一个 Release 发布后将在此添加下载链接。
 
 发布包分为两个部分，请从 [Releases](https://github.com/yumenana/Caelum/releases) 下载两者：
 
