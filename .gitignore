@@ -387,6 +387,7 @@ FodyWeavers.xsd
 !/.editorconfig
 
 # Caelum 项目源码
+!/Caelum/model/PPBUnet_v1/PPBUNet_v1_x4.py
 !/Caelum/model/PPBUnet_v1/dataset.py
 !/Caelum/model/PPBUnet_v1/modules.py
 !/Caelum/model/PPBUnet_v1/hat.py
