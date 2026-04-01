@@ -4,7 +4,7 @@ Loss Functions for Anime Super-Resolution Training
 
 PPBUNet 训练用自包含损失函数库。
 
-11 个子损失覆盖像素、色彩、频域、空间、感知、对抗六个维度,
+12 个子损失覆盖像素、色彩、频域、空间、感知、对抗六个维度,
 按 2 阶段渐进式启用, 由 CaelumLossV2 统一调度。
 
 各损失的职责划分:
@@ -13,9 +13,10 @@ PPBUNet 训练用自包含损失函数库。
   Crevice       夹缝色偏修不修              (形态学 + OKLCH)
   Histogram     分布偏不偏                  (边缘掩码不对称直方图)
   Gibbs         能量超没超                  (频域单侧天花板)
-  ATGV          平坦区纯不纯                (形态学硬掩码 + Charbonnier)
+  STGV          平坦区纯不纯                (形态学硬掩码 + Charbonnier)
+  SmoothGradH   渐变顺不顺                  (结构张量带通 + Hessian)
   Angular       线条直不直                  (Farid 梯度角距离)
-  TurningPoint  拐弯尖不尖                  (结构张量角点响应)
+  TurningPoint  拐弯尖不尖                  (结构张量角点响应 + 密度衰减空间NMS)
   Perceptual    语义对不对                  (Danbooru ConvNeXt 余弦距离)
   Decoupled D   结构真不真                  (解耦对抗, 纹理免罚)
 
@@ -37,8 +38,12 @@ Components:
   Spatial / Frequency:
     GibbsRingingPenaltySWT             Haar SWT one-sided overshoot penalty
     StrictFlatTGVLoss                  Strict flat-region TGV (Charbonnier)
+    SmoothGradientHessianLoss          Structure-tensor guided Hessian penalty
     AngularFluencyLoss                 Farid 7x7 gradient angular distance
-    TurningPointLoss                   Structure tensor corner + curvature L1
+    TopologicalSingularityLoss          Structure tensor corner + density-decayed spatial NMS
+
+  Gate Regularization:
+    GateTolerancePenalty               Masked soft-gating hinge + cosine annealing
 
   Perceptual:
     AnimePerceptualLossV2              Danbooru ConvNeXt cosine perceptual
@@ -49,10 +54,12 @@ Components:
     DecoupledGANLoss                   Asymmetric adversarial loss
 
   Combined:
-    CaelumLossV2                       2-phase progressive (11 sub-losses)
+    CaelumLossV2                       2-phase progressive (12 sub-losses)
 
 作者: YumeNana
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -742,26 +749,40 @@ class AngularFluencyLoss(nn.Module):
         return (angular_dist * mask).mean()
 
 
-class TurningPointLoss(nn.Module):
-    """Turning Point / Bending Energy Loss (转折点曲率感知损失).
+class TopologicalSingularityLoss(nn.Module):
+    """Topological Singularity Loss — Density-Decayed Spatial NMS
+    (拓扑奇异点感知损失 — 密度衰减版).
 
-    通过结构张量特征值映射 (C = 4·det(S)/(trace(S)²+ε)) 检测角点/交叉点,
-    C ∈ [0,1]: 角点=1, 直线=0, 平坦=0, 无 Hessian 曲率的 NaN 奇点。
-    双重损失: 曲率引导动态 L1 (角点放大 β 倍) + 弯曲能量 MSE 回归。
-    与 AngularFluency 正交: Angular 管边缘方向 (λ₁>>λ₂), TurningPoint 管角点 (λ₁≈λ₂)。
+    基于"峰值能量占比 (Peak-to-Energy Ratio)"机制, 根除"密度坍塌悖论"。
+    通过计算结构张量角点响应 (C) 的局部空间密度 (E), 施加指数级衰减。
+    - 孤立 "V", "Y": 密度极低, 保留 100% 超级惩罚, 逼迫网络雕刻锋利针尖。
+    - 交叉 "X", "+": 密度中等, 保留中度惩罚, 维持拓扑连通。
+    - 混乱 "#", "$": 密度极高, 指数衰减彻底剥夺惩罚权重,
+      释放梯度压力, 允许网络在密集网格处执行平滑降噪, 防止整体"摆烂"。
+
+    数学核心:
+      E = AvgPool_{K×K}(C_gt)           局部角点空间密度
+      S = exp(-decay_factor × E)        指数级密度衰减因子
+      W = 1 + β × C_gt × S             密度调制后的动态权重
 
     Args:
-        beta:  角点 L1 放大倍数 (1+β)
-        gamma: 弯曲能量回归权重
-        eps:   数值稳定性常数
+        beta:           奇异点 L1 放大基准倍数
+        gamma:          弯曲能量回归权重
+        density_kernel: 计算局部密度的窗口大小 (对应 ~3px 半径)
+        decay_factor:   指数衰减陡峭度 (越大对密集区容忍度越低)
+        eps:            数值安全常数
     """
-
     def __init__(self, beta: float = 10.0, gamma: float = 2.0,
+                 density_kernel: int = 7, decay_factor: float = 15.0,
                  eps: float = 1e-6):
         super().__init__()
         self.beta = beta
         self.gamma = gamma
+        self.decay_factor = decay_factor
         self.eps = eps
+
+        self.density_kernel = density_kernel
+        self.density_padding = density_kernel // 2
 
         p = torch.tensor([0.004711, 0.069321, 0.245410, 0.361117,
                           0.245410, 0.069321, 0.004711], dtype=torch.float32)
@@ -770,24 +791,22 @@ class TurningPointLoss(nn.Module):
         self.register_buffer('kx', torch.outer(p, d).view(1, 1, 7, 7))
         self.register_buffer('ky', torch.outer(d, p).view(1, 1, 7, 7))
 
-        grid = torch.arange(5, dtype=torch.float32) - 2
-        gaussian_1d = torch.exp(-grid ** 2 / 2.0)
+        grid = torch.arange(3, dtype=torch.float32) - 1
+        gaussian_1d = torch.exp(-grid ** 2 / (2.0 * 0.5 ** 2))
         g_kernel = torch.outer(gaussian_1d, gaussian_1d)
         g_kernel = g_kernel / g_kernel.sum()
-        self.register_buffer('g_kernel', g_kernel.view(1, 1, 5, 5))
+        self.register_buffer('g_kernel', g_kernel.view(1, 1, 3, 3))
 
     def _corner_map(self, x: torch.Tensor) -> torch.Tensor:
+        """提取亚像素级角点响应图 C ∈ [0, 1]."""
         gray = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
-
         gray_pad = F.pad(gray, (3, 3, 3, 3), mode='reflect')
         Ix = F.conv2d(gray_pad, self.kx)
         Iy = F.conv2d(gray_pad, self.ky)
 
-        Ixx = Ix * Ix
-        Iyy = Iy * Iy
-        Ixy = Ix * Iy
+        Ixx, Iyy, Ixy = Ix * Ix, Iy * Iy, Ix * Iy
 
-        pad_g = (2, 2, 2, 2)
+        pad_g = (1, 1, 1, 1)
         Sxx = F.conv2d(F.pad(Ixx, pad_g, mode='reflect'), self.g_kernel)
         Syy = F.conv2d(F.pad(Iyy, pad_g, mode='reflect'), self.g_kernel)
         Sxy = F.conv2d(F.pad(Ixy, pad_g, mode='reflect'), self.g_kernel)
@@ -801,12 +820,208 @@ class TurningPointLoss(nn.Module):
         C_pred = self._corner_map(pred)
         with torch.no_grad():
             C_gt = self._corner_map(target)
-            W_gt = 1.0 + self.beta * C_gt
+
+            E_gt = F.avg_pool2d(C_gt, kernel_size=self.density_kernel,
+                                stride=1, padding=self.density_padding)
+
+            S_decay = torch.exp(-self.decay_factor * E_gt)
+
+            W_gt = 1.0 + self.beta * C_gt * S_decay
 
         loss_weighted_l1 = (W_gt * torch.abs(pred - target)).mean()
-        loss_bending = F.mse_loss(C_pred, C_gt)
+
+        loss_bending = (S_decay * (C_pred - C_gt) ** 2).mean()
 
         return loss_weighted_l1 + self.gamma * loss_bending
+
+
+TurningPointLoss = TopologicalSingularityLoss
+
+
+class SmoothGradientHessianLoss(nn.Module):
+    """Smooth Gradient Region Hessian Penalty Loss
+    (平滑渐变区 Hessian 惩罚损失 — 结构张量引导).
+
+    针对插画中大面积的色彩渐变区 (如天空、肤色阴影)。
+    这些区域一阶导数不为零 (有色彩过渡), 但二阶导数 (Hessian) 应该绝对为零 (匀速过渡)。
+    利用结构张量 (Structure Tensor) 的特征值相干性 (Coherence) 与能量带通滤波,
+    精准锁定"方向一致且能量适中"的渐变坡面, 惩罚其 Hessian 范数,
+    彻底消除超分导致的色彩断层 (Color Banding) 和微小波纹。
+    与 StrictFlatTGV 互补: TGV 管绝对平坦 (一阶导=0), 本损失管平滑渐变 (二阶导=0)。
+
+    Args:
+        tau_low:  能量下界 (过滤绝对平坦区, 交由 StrictFlatTGV 处理)
+        tau_high: 能量上界 (过滤锐利边缘/线稿, 交由 AngularFluency 处理)
+        k1, k2:   Sigmoid 软阈值陡峭度
+        epsilon:  防除零/NaN 安全常数
+    """
+
+    def __init__(self, tau_low: float = 0.001, tau_high: float = 0.05,
+                 k1: float = 100.0, k2: float = 100.0, epsilon: float = 1e-6):
+        super().__init__()
+        self.tau_low = tau_low
+        self.tau_high = tau_high
+        self.k1 = k1
+        self.k2 = k2
+        self.epsilon = epsilon
+
+        scharr_x = torch.tensor([[-3., 0., 3.],
+                                 [-10., 0., 10.],
+                                 [-3., 0., 3.]], dtype=torch.float32) / 32.0
+        scharr_y = scharr_x.t()
+
+        d_xx = torch.tensor([[0., 0., 0.],
+                             [1., -2., 1.],
+                             [0., 0., 0.]], dtype=torch.float32)
+        d_yy = d_xx.t()
+        d_xy = torch.tensor([[1., 0., -1.],
+                             [0., 0., 0.],
+                             [-1., 0., 1.]], dtype=torch.float32) / 4.0
+
+        gaussian = torch.tensor([[1., 2., 1.],
+                                 [2., 4., 2.],
+                                 [1., 2., 1.]], dtype=torch.float32) / 16.0
+
+        self.register_buffer('w_x', scharr_x.view(1, 1, 3, 3))
+        self.register_buffer('w_y', scharr_y.view(1, 1, 3, 3))
+        self.register_buffer('w_xx', d_xx.view(1, 1, 3, 3))
+        self.register_buffer('w_yy', d_yy.view(1, 1, 3, 3))
+        self.register_buffer('w_xy', d_xy.view(1, 1, 3, 3))
+        self.register_buffer('w_g', gaussian.view(1, 1, 3, 3))
+
+    def _apply_conv(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        x_flat = x.reshape(b * c, 1, h, w)
+        x_pad = F.pad(x_flat, (1, 1, 1, 1), mode='reflect')
+        out = F.conv2d(x_pad, weight)
+        return out.view(b, c, h, w)
+
+    def _compute_mask(self, target: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            smooth_target = self._apply_conv(target, self.w_g)
+
+            I_x = self._apply_conv(smooth_target, self.w_x)
+            I_y = self._apply_conv(smooth_target, self.w_y)
+
+            S_xx = self._apply_conv(I_x ** 2, self.w_g)
+            S_yy = self._apply_conv(I_y ** 2, self.w_g)
+            S_xy = self._apply_conv(I_x * I_y, self.w_g)
+
+            trace = S_xx + S_yy
+            det = S_xx * S_yy - S_xy ** 2
+
+            discriminant = torch.sqrt(
+                torch.clamp(trace ** 2 - 4 * det, min=0.0) + self.epsilon)
+
+            lambda_1 = (trace + discriminant) / 2.0
+            lambda_2 = (trace - discriminant) / 2.0
+
+            coherence = ((lambda_1 - lambda_2)
+                         / (lambda_1 + lambda_2 + self.epsilon)) ** 2
+
+            energy = trace
+            mask_low = torch.sigmoid(self.k1 * (energy - self.tau_low))
+            mask_high = torch.sigmoid(self.k2 * (self.tau_high - energy))
+
+            mask = mask_low * mask_high * coherence
+            spatial_mask = mask.mean(dim=1, keepdim=True)
+
+        return spatial_mask
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        mask = self._compute_mask(target)
+
+        pred_xx = self._apply_conv(pred, self.w_xx)
+        pred_yy = self._apply_conv(pred, self.w_yy)
+        pred_xy = self._apply_conv(pred, self.w_xy)
+
+        hessian_norm = torch.sqrt(
+            pred_xx ** 2 + 2 * pred_xy ** 2 + pred_yy ** 2 + self.epsilon)
+
+        masked_hessian = mask * hessian_norm
+        valid_area = mask.sum().clamp(min=self.epsilon)
+        return masked_hessian.sum() / valid_area
+
+
+class GateTolerancePenalty(nn.Module):
+    """Masked Soft-Gating Penalty with Time Annealing
+    (基于平坦掩膜的铰链门控惩罚 + 余弦时间退火).
+
+    在 GT 平坦区域中, 当 BADI 门控值超过容忍阈值时施加单侧惩罚,
+    防止门控惰性导致浅层噪声泄漏至深层特征。
+    仅惩罚超出 tolerance 的部分 (铰链损失), 边缘区域不受约束。
+    训练前 cutoff_ratio 阶段生效, 之后余弦退火至 0 防止梯度断崖。
+
+    公式: Loss = w(t) × Mean( ReLU(alpha ⊙ flat_mask - tolerance) )
+    其中 w(t) = cosine_anneal(progress, cutoff_ratio, decay_width)
+
+    Args:
+        tolerance:      平坦区门控容忍上限 (默认 0.15)
+        cutoff_ratio:   训练进度截断点 (默认 0.7)
+        decay_width:    截断前余弦衰减窗口宽度 (默认 0.1)
+        flat_threshold: 局部方差平坦判定阈值 (默认 1/255)
+        patch_size:     局部方差计算窗口 (默认 5)
+    """
+
+    def __init__(self, tolerance: float = 0.15, cutoff_ratio: float = 0.7,
+                 decay_width: float = 0.1, flat_threshold: float = 1.0 / 255.0,
+                 patch_size: int = 5):
+        super().__init__()
+        self.tolerance = tolerance
+        self.cutoff_ratio = cutoff_ratio
+        self.decay_width = decay_width
+        self.flat_threshold = flat_threshold
+        self.patch_size = patch_size
+        self.padding = patch_size // 2
+        self._progress = 0.0
+
+    def set_progress(self, progress: float):
+        """Set current training progress in [0, 1]."""
+        self._progress = max(0.0, min(1.0, progress))
+
+    def _get_annealing_weight(self) -> float:
+        """Cosine annealing: 1.0 → decay → 0.0 at cutoff."""
+        p = self._progress
+        c = self.cutoff_ratio
+        d = self.decay_width
+        if p >= c:
+            return 0.0
+        decay_start = c - d
+        if p <= decay_start:
+            return 1.0
+        t = (p - decay_start) / d
+        return 0.5 * (1.0 + math.cos(math.pi * t))
+
+    def _compute_flat_mask(self, target: torch.Tensor) -> torch.Tensor:
+        """GT 局部方差→平坦区硬掩膜 (1=平坦, 0=边缘)."""
+        local_mean = F.avg_pool2d(target, self.patch_size, stride=1,
+                                  padding=self.padding)
+        local_mean_sq = F.avg_pool2d(target ** 2, self.patch_size, stride=1,
+                                     padding=self.padding)
+        local_var = (local_mean_sq - local_mean ** 2).clamp(min=0)
+        local_var = local_var.max(dim=1, keepdim=True)[0]
+        return (local_var < self.flat_threshold).float()
+
+    def forward(self, gate: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Args:
+            gate:   BADI 空间门控 (B, 1, H_lr, W_lr), 值域 [0, 1]
+            target: HR GT 图像 (B, 3, H_hr, W_hr)
+        """
+        weight = self._get_annealing_weight()
+        if weight <= 0:
+            return torch.zeros(1, device=gate.device, dtype=gate.dtype)
+
+        with torch.no_grad():
+            flat_mask = self._compute_flat_mask(target)
+            if flat_mask.shape[2:] != gate.shape[2:]:
+                flat_mask = F.interpolate(
+                    flat_mask, gate.shape[2:],
+                    mode='bilinear', align_corners=False,
+                )
+
+        excess = F.relu(gate * flat_mask - self.tolerance)
+        loss = excess.mean()
+        return weight * loss
 
 
 # ======================================================================
@@ -940,7 +1155,7 @@ class CaelumLossV2(nn.Module):
     self.weights 是公开 dict, 训练循环可随时修改。
     返回 dict: 'total' 为加权总和 (tensor), 其余为原始值 (.item() float)。
 
-    Phase 1 (0% ~ phase_2_start): l1, flat, oklch, atgv
+    Phase 1 (0% ~ phase_2_start): l1, flat, oklch, stgv, smooth_grad_hessian
     Phase 2 (phase_2_start ~ 100%): + chroma_grad, crevice, histogram,
         gibbs, angular, turning_point, perceptual
 
@@ -948,9 +1163,9 @@ class CaelumLossV2(nn.Module):
         weights:            损失权重字典 (覆盖 DEFAULT_WEIGHTS)
         phase_2_start:      Phase 2 启用阈值 (训练进度)
         oklch_alpha/beta:   OKLCH 内部权重
-        atgv_alpha1/alpha2: StrictFlatTGV 变分权重
-        atgv_flat_threshold: 绝对平坦梯度幅值上限
-        atgv_safe_margin:   形态学隔离带大小
+        stgv_alpha1/alpha2: StrictFlatTGV 变分权重
+        stgv_flat_threshold: 绝对平坦梯度幅值上限
+        stgv_safe_margin:   形态学隔离带大小
         angular_threshold:  线条方向损失梯度幅值激活阈值
         tp_beta/gamma:      转折点 L1 放大倍数 / 弯曲能量权重
         perceptual_layers:  感知损失层配置
@@ -960,11 +1175,12 @@ class CaelumLossV2(nn.Module):
         'l1':           1.0,
         'flat':         1.0,
         'oklch':        4.0,
-        'atgv':         0.1,
+        'stgv':         0.1,
         'chroma_grad':  2.0,
         'crevice':      4.0,
         'histogram':    2.0,
         'gibbs':        16.0,
+        'smooth_grad_hessian': 2.0,
         'angular':      4.0,
         'turning_point': 1.0,
         'perceptual':   0.5,
@@ -976,10 +1192,10 @@ class CaelumLossV2(nn.Module):
         phase_2_start: float = 0.3,
         oklch_alpha: float = 1.0,
         oklch_beta: float = 3.0,
-        atgv_alpha1: float = 1.0,
-        atgv_alpha2: float = 2.0,
-        atgv_flat_threshold: float = 0.01,
-        atgv_safe_margin: int = 3,
+        stgv_alpha1: float = 1.0,
+        stgv_alpha2: float = 2.0,
+        stgv_flat_threshold: float = 0.01,
+        stgv_safe_margin: int = 3,
         angular_threshold: float = 0.05,
         tp_beta: float = 10.0,
         tp_gamma: float = 2.0,
@@ -998,8 +1214,9 @@ class CaelumLossV2(nn.Module):
         self.l1_loss = nn.L1Loss()
         self.flat_loss = FlatRegionAwareLoss()
         self.oklch_loss = OklchColorLoss(oklch_alpha, oklch_beta)
-        self.atgv_loss = StrictFlatTGVLoss(atgv_alpha1, atgv_alpha2,
-                                              atgv_flat_threshold, atgv_safe_margin)
+        self.stgv_loss = StrictFlatTGVLoss(stgv_alpha1, stgv_alpha2,
+                                              stgv_flat_threshold, stgv_safe_margin)
+        self.smooth_grad_hessian_loss = SmoothGradientHessianLoss()
 
         # === Phase 2 ===
         self.chroma_grad_loss = ChromaGradientLoss()
@@ -1007,7 +1224,7 @@ class CaelumLossV2(nn.Module):
         self.histogram_loss = MaskedAsymmetricHistogramLoss()
         self.gibbs_loss = GibbsRingingPenaltySWT()
         self.angular_loss = AngularFluencyLoss(angular_threshold)
-        self.turning_point_loss = TurningPointLoss(tp_beta, tp_gamma)
+        self.turning_point_loss = TopologicalSingularityLoss(tp_beta, tp_gamma)
 
         self.perceptual_loss = None
         if self.weights.get('perceptual', 0) > 0:
@@ -1028,12 +1245,14 @@ class CaelumLossV2(nn.Module):
         raw_l1 = self.l1_loss(pred, target)
         raw_flat = self.flat_loss(pred, target)
         raw_oklch = self.oklch_loss(pred, target)
-        raw_atgv = self.atgv_loss(pred, target)
+        raw_stgv = self.stgv_loss(pred, target)
+        raw_sgh = self.smooth_grad_hessian_loss(pred, target)
 
         total = (w['l1'] * raw_l1
                  + w['flat'] * raw_flat
                  + w['oklch'] * raw_oklch
-                 + w['atgv'] * raw_atgv)
+                 + w['stgv'] * raw_stgv
+                 + w['smooth_grad_hessian'] * raw_sgh)
 
         raw_cg = raw_crv = raw_hist = zero
         raw_gibbs = raw_angular = raw_tp = raw_perc = zero
@@ -1065,7 +1284,8 @@ class CaelumLossV2(nn.Module):
             'l1': _v(raw_l1),
             'flat': _v(raw_flat),
             'oklch': _v(raw_oklch),
-            'atgv': _v(raw_atgv),
+            'stgv': _v(raw_stgv),
+            'smooth_grad_hessian': _v(raw_sgh),
             'chroma_grad': _v(raw_cg),
             'crevice': _v(raw_crv),
             'histogram': _v(raw_hist),
@@ -1158,8 +1378,29 @@ if __name__ == "__main__":
     val_ang_flat = angular(flat_ang, flat_ang)
     print(f"  纯平坦:       loss={val_ang_flat.item():.6f} (应≈0)")
 
-    print("\n■ TurningPointLoss:")
-    tp = TurningPointLoss().to(device)
+    print("\n■ SmoothGradientHessianLoss:")
+    sgh = SmoothGradientHessianLoss().to(device)
+
+    sgh_pred = torch.randn(2, 3, 64, 64, device=device).clamp(0, 1).requires_grad_(True)
+    val_sgh = sgh(sgh_pred, target)
+    val_sgh.backward()
+    print(f"  随机对:       loss={val_sgh.item():.6f}, grad={sgh_pred.grad.norm().item():.6f}")
+    sgh_pred.grad.zero_()
+
+    flat_sgh = torch.full((2, 3, 64, 64), 0.5, device=device)
+    val_sgh_flat = sgh(flat_sgh, flat_sgh)
+    print(f"  纯平坦自身:   loss={val_sgh_flat.item():.8f} (应≈0, 平坦区被排除)")
+
+    grad_sgh = torch.linspace(0, 1, 64, device=device).view(1, 1, 1, 64).expand(2, 3, 64, 64).contiguous()
+    val_sgh_grad = sgh(grad_sgh, grad_sgh)
+    print(f"  完美线性渐变: loss={val_sgh_grad.item():.8f} (应≈0, Hessian=0)")
+
+    noisy_grad_sgh = grad_sgh + 0.02 * torch.sin(torch.linspace(0, 20 * 3.14159, 64, device=device)).view(1, 1, 1, 64)
+    val_sgh_wavy = sgh(noisy_grad_sgh.clamp(0, 1), grad_sgh)
+    print(f"  渐变+波纹:    loss={val_sgh_wavy.item():.6f} (应>0, 波纹被惩罚)")
+
+    print("\n■ TopologicalSingularityLoss:")
+    tp = TopologicalSingularityLoss().to(device)
 
     tp_pred = torch.randn(2, 3, 64, 64, device=device).clamp(0, 1).requires_grad_(True)
     val_tp = tp(tp_pred, target)
@@ -1179,6 +1420,22 @@ if __name__ == "__main__":
     cross[:, :, :, 30:34] = 1.0
     val_tp_corner = tp._corner_map(cross)
     print(f"  十字交叉 C_max: {val_tp_corner.max().item():.4f} (应>0)")
+
+    with torch.no_grad():
+        C_cross = tp._corner_map(cross)
+        E_cross = F.avg_pool2d(C_cross, kernel_size=tp.density_kernel,
+                               stride=1, padding=tp.density_padding)
+        S_cross = torch.exp(-tp.decay_factor * E_cross)
+        print(f"  十字交叉 S_decay 范围: [{S_cross.min().item():.4f}, {S_cross.max().item():.4f}]")
+
+    iso_v = torch.zeros(2, 3, 64, 64, device=device)
+    iso_v[:, :, 28:36, 30:34] = 1.0
+    with torch.no_grad():
+        C_iso = tp._corner_map(iso_v)
+        E_iso = F.avg_pool2d(C_iso, kernel_size=tp.density_kernel,
+                             stride=1, padding=tp.density_padding)
+        S_iso = torch.exp(-tp.decay_factor * E_iso)
+        print(f"  孤立线段 S_decay 范围: [{S_iso.min().item():.4f}, {S_iso.max().item():.4f}] (应接近1)")
 
     print("\n■ DecoupledUNetDiscriminatorSN:")
     disc = DecoupledUNetDiscriminatorSN(64).to(device)
@@ -1224,7 +1481,8 @@ if __name__ == "__main__":
     out1['total'].backward()
     print(f"  Phase 1: total={out1['total'].item():.4f} "
           f"l1={out1['l1']:.4f} flat={out1['flat']:.4f} "
-          f"oklch={out1['oklch']:.4f} atgv={out1['atgv']:.4f}")
+          f"oklch={out1['oklch']:.4f} stgv={out1['stgv']:.4f} "
+          f"sgh={out1['smooth_grad_hessian']:.4f}")
     print(f"           chroma_grad={out1['chroma_grad']} (应=0.0)")
     v2_pred.grad.zero_()
 
@@ -1232,7 +1490,8 @@ if __name__ == "__main__":
     out2 = criterion(v2_pred, v2_target)
     out2['total'].backward()
     print(f"  Phase 2: total={out2['total'].item():.4f} "
-          f"gibbs={out2['gibbs']:.4f} angular={out2['angular']:.4f} "
+          f"gibbs={out2['gibbs']:.4f} "
+          f"angular={out2['angular']:.4f} "
           f"tp={out2['turning_point']:.4f} cg={out2['chroma_grad']:.4f}")
     v2_pred.grad.zero_()
 
