@@ -265,7 +265,7 @@ HR Original
 
 ### Loss Function Design
 
-`CaelumLossV2` coordinates **11 sub-losses** spanning pixel, color, frequency, spatial, perceptual, and adversarial dimensions, using a **two-phase progressive activation** strategy.
+`CaelumLossV2` coordinates **12 sub-losses** spanning pixel, color, frequency, spatial, perceptual, and adversarial dimensions, using a **two-phase progressive activation** strategy.
 
 #### Two-Phase Progressive Strategy
 
@@ -289,6 +289,7 @@ Phase 1 lets the network converge to the correct color and pixel distribution; P
 | `FlatRegionAwareLoss` | 1.0 | Amplifies L1 weight 10× in flat regions, preventing small errors in the 60–80% flat-colored pixels from being drowned out by edge gradients |
 | `OklchColorLoss` | 4.0 | OKLCH perceptual color space: chroma L1 + hue cosine joint constraint, atan2-free |
 | `StrictFlatTGVLoss` | 0.1 | Morphological hard mask isolates flat regions; Charbonnier penalizes 1st+2nd derivatives→0, eliminating flat-area ripple |
+| `SmoothGradientHessianLoss` | 2.0 | Structure-tensor guided Hessian penalty on smooth gradient regions; suppresses color banding and micro-ripple in graduation areas |
 
 **Phase 2 (added when training progress ≥ 30%)**
 
@@ -315,6 +316,14 @@ Obtain the InfoNCE skip-connection mutual information loss via `model.mi_loss` d
 
 ```python
 loss = criterion(pred, hr) + 0.01 * model.mi_loss
+```
+
+**BADI Gate Regularization (optional)**
+
+`GateTolerancePenalty` applies a hinge penalty on `model.badi.last_gate` over GT flat regions, discouraging gate laziness that would allow shallow-layer noise to leak through. Cosine anneals to zero at 70% training progress; recommended weight λ≈0.001:
+
+```python
+loss = loss + 0.001 * gate_penalty(model.badi.last_gate, gt)
 ```
 
 ---
@@ -371,7 +380,7 @@ Caelum/                            ← Repository root
 
 - [x] PPBUNet v1.0 architecture design (ParallelOAM · FrequencyRouter · MIM · RMA · HAT · CornerAwareDCN · AMADSUpsampler)
 - [x] Multi-platform degradation simulation pipeline (5 modes · 3-stage high-order chain · online real-time generation)
-- [x] Custom loss function system (CaelumLossV2 · 11 sub-losses · two-phase progressive strategy)
+- [x] Custom loss function system (CaelumLossV2 · 12 sub-losses · two-phase progressive strategy · optional BADI gate regularizer)
 - [x] Early checkpoint validation
 
 #### 🔄 In Progress

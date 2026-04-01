@@ -2,19 +2,25 @@
 Dataset Pipeline for Anime Super-Resolution Training
 =====================================================
 
-PPBUNet 训练数据管线。
-模拟"电子包浆"
-从 HR 源图像实时生成 (LR, HR) 配对。
+PPBUNet 训练数据管线 (scale-aware v2)。
+模拟"电子包浆", 从 HR 源图像实时生成 (LR, HR) 配对。
+支持 scale_factor ∈ {1, 2, 4}:
+  1× 纯去伪影 — 零模糊, 仅压缩链路
+  2× 轻度超分 — 模糊核 ≤ 3×3, 概率减半
+  4× 标准超分 — 模糊核 ≤ 5×5, 完整退化链路
 
 Pipeline:
-  HR image (>=480p) -> random crop -> augmentation -> degradation -> (LR, HR) pair
+  HR image (>=480p) → random crop → augmentation → degradation → (LR, HR) pair
 
 Degradation Modes:
-  mode 0: Pure bicubic downscale 4x (validation)
-  mode 1: Pre-blur + bicubic downscale 4x (upscale only)
-  mode 2: Bicubic downscale 4x + random 1-3x JPEG/WebP (light)
-  mode 3: 2-stage high-order degradation lv2 (medium — "social media repost")
-  mode 4: 3-stage high-order degradation lv3 (heavy — "digital patina")
+  mode 0: Pure bicubic downscale (validation; 1× = identity)
+  mode 1: Pre-blur + bicubic downscale (1× = identity)
+  mode 2: Downscale + random JPEG/WebP (1× = compression only)
+  mode 3: 3-stage high-order lv2 (medium — "social media repost")
+  mode 4: 3-stage high-order lv3 (heavy — "digital patina")
+
+第一性原理: blur_kernel ≤ scale_factor + 1
+  下采样前模糊核不超出计算窗口, 保证退化是自然抗锯齿而非过度平滑。
 
 Mixed Sampling (CaelumMixedDataset):
   mode1=10%, mode2=30%, mode3=35%, mode4=25%
@@ -93,30 +99,26 @@ def apply_random_compression(img: Image.Image, jpeg_quality: int,
     return apply_jpeg_compression(img, jpeg_quality)
 
 
-def apply_pre_blur(img: Image.Image) -> Image.Image:
-    """降采样前预模糊。
+def apply_pre_blur(img: Image.Image, max_sigma: float = 1.0) -> Image.Image:
+    """降采样前预模糊 (scale-aware)。
 
-    模拟创作者上传前的抗锯齿或软件自动平滑;
-    50% Gaussian(r=2) / 50% Gaussian(r=1)+Box 两种模式覆盖不同软件行为。
+    sigma ∈ [max_sigma/2, max_sigma], 确保模糊核不超出下采样计算窗口:
+      4× → max_sigma=1.0 → GaussianBlur(σ≤1.0) → 有效核 ≤ 5×5 (∈ 4+1)
+      2× → max_sigma=0.5 → GaussianBlur(σ≤0.5) → 有效核 ≤ 3×3 (∈ 2+1)
+    连续随机 sigma 比离散选择提供更丰富的退化多样性。
     """
-    if random.random() < 0.5:
-        return img.filter(ImageFilter.GaussianBlur(radius=2))
-    img = img.filter(ImageFilter.GaussianBlur(radius=1))
-    return img.filter(ImageFilter.BLUR)
+    sigma = random.uniform(max_sigma * 0.5, max_sigma)
+    return img.filter(ImageFilter.GaussianBlur(radius=sigma))
 
 
-def apply_stage_blur(img: Image.Image) -> Image.Image:
-    """退化阶段间模糊。
+def apply_stage_blur(img: Image.Image, max_sigma: float = 0.8) -> Image.Image:
+    """退化阶段间模糊 (scale-aware)。
 
-    模拟平台转存时服务端图像处理管线的二次平滑;
-    三种核 (Gaussian r=1 / Box / Gaussian r=2) 覆盖不同平台实现。
+    sigma ∈ [max_sigma*0.3, max_sigma], 比 pre_blur 更轻。
+    模拟平台转存时服务端图像处理管线的二次平滑。
     """
-    choice = random.randint(0, 2)
-    if choice == 0:
-        return img.filter(ImageFilter.GaussianBlur(radius=1))
-    elif choice == 1:
-        return img.filter(ImageFilter.BLUR)
-    return img.filter(ImageFilter.GaussianBlur(radius=2))
+    sigma = random.uniform(max_sigma * 0.3, max_sigma)
+    return img.filter(ImageFilter.GaussianBlur(radius=sigma))
 
 
 def break_dct_grid(img: Image.Image) -> tuple:
@@ -136,20 +138,24 @@ def undo_dct_shift(img: Image.Image, dy: int, dx: int) -> Image.Image:
     return Image.fromarray(np.roll(np.array(img), (-dy, -dx), (0, 1)))
 
 
-def sample_first_stage_scale() -> float:
-    """第一阶段缩放因子采样。
+def sample_first_stage_scale(scale_min: float = 0.6) -> float:
+    """第一阶段缩放因子采样 (scale-aware)。
 
-    50%→0.5 (常见的 2 倍缩放上传) |
-    25%→1.0 (原尺寸上传) |
-    25%→U(0.5,1.0) (任意缩放)。
-    覆盖创作者上传时的各种缩放行为。
+    scale_min 由下采样倍率决定:
+      4× → scale_min=0.6 → 创作者可能中幅缩放上传
+      2× → scale_min=0.8 → 缩放幅度更保守
+      1× → scale_min=1.0 → 不缩放
+
+    采样分布: 40%→scale_min | 30%→1.0 | 30%→U(scale_min, 1.0)
     """
-    r = random.random()
-    if r < 0.50:
-        return 0.5
-    elif r < 0.75:
+    if scale_min >= 1.0:
         return 1.0
-    return random.uniform(0.5, 1.0)
+    r = random.random()
+    if r < 0.40:
+        return scale_min
+    elif r < 0.70:
+        return 1.0
+    return random.uniform(scale_min, 1.0)
 
 
 def generate_sinc_kernel(kernel_size: int, omega_c: float) -> torch.Tensor:
@@ -182,18 +188,16 @@ def apply_sinc_filter(img: Image.Image, kernel: torch.Tensor) -> Image.Image:
     return Image.fromarray((out.numpy() * 255).round().astype(np.uint8))
 
 
-def apply_sinc_ringing(img: Image.Image, level: int) -> Image.Image:
-    """施加 Sinc 振铃伪影。
+def apply_sinc_ringing(img: Image.Image, omega_range: tuple,
+                       ks_choices: tuple) -> Image.Image:
+    """施加 Sinc 振铃伪影 (scale-aware)。
 
-    lv2 截止频率 ω∈[2π/3,π] → 轻度振铃 (仅最高频过冲);
-    lv3 截止频率 ω∈[π/3,2π/3] → 重度振铃 (中频也受影响, 可见马赫带)。
-    小图用 7/9 核避免超出图像尺寸, 大图用 11/13 核覆盖更宽振铃。
+    omega_range, ks_choices 由 SCALE_PROFILES 提供, 保证振铃强度与缩放倍率匹配:
+      4× → ω 接近 π (轻度截频), 核 9-11
+      2× → ω 更接近 π (极轻截频), 核 5-7
     """
-    ks = random.choice([7, 9] if min(img.size) < 128 else [11, 13])
-    if level == 2:
-        omega = random.uniform(2 * math.pi / 3, math.pi)
-    else:
-        omega = random.uniform(math.pi / 3, 2 * math.pi / 3)
+    ks = random.choice(ks_choices)
+    omega = random.uniform(*omega_range)
     return apply_sinc_filter(img, generate_sinc_kernel(ks, omega))
 
 
@@ -203,34 +207,91 @@ def apply_sinc_ringing(img: Image.Image, level: int) -> Image.Image:
 
 
 MODE_NAMES = {
-    0: '纯 bicubic (验证用)',
-    1: '纯放大 (预模糊 + bicubic)',
-    2: '轻度退化 (bicubic + 随机多次压缩)',
-    3: '中度退化 (高阶 2 阶段, lv2)',
-    4: '重度退化 (高阶 3 阶段, lv3)',
+    0: '纯 bicubic (验证用; 1× = identity)',
+    1: '纯放大 (预模糊 + bicubic; 1× = identity)',
+    2: '轻度退化 (bicubic + 随机压缩; 1× = 仅压缩)',
+    3: '中度退化 (3 阶段, lv2 — "社交媒体转存")',
+    4: '重度退化 (3 阶段, lv3 — "电子包浆")',
 }
 
 
 class DegradationPipeline:
-    """Multi-level Degradation Generator (多级退化生成器).
+    """Scale-aware multi-level degradation generator.
 
-    高阶退化 (mode 3/4) 模拟"电子包浆"全链路:
-      Stage 1 (创作者上传): HR → 模糊 → 缩放 → 压缩 (q=75-95)
-      Stage 2 (平台转存):   → DCT偏移 → 振铃 → 模糊 → 缩放 → 压缩 (q=50-80)
-      Stage 3 (终端获取):   → DCT偏移 → 放大截图 → 最终压缩 (lv2:40-75 / lv3:10-40)
+    ■ 多倍率支持 (scale_factor ∈ {1, 2, 4}) ■
+    ──────────────────────────────────────────
+    第一性原理: 模糊核不超出下采样计算窗口。
+      N× 下采样时, 每个 LR 像素聚合 N×N HR 区域,
+      模糊核 ≤ (N+1)×(N+1) 是自然抗锯齿, 超出则为人工过度平滑。
 
-    每个阶段独立随机化, 组合爆炸式覆盖真实退化空间。
+      4× → blur σ≤1.0, 有效核 ≤ 5×5 (∈ 4+1)
+      2× → blur σ≤0.5, 有效核 ≤ 3×3 (∈ 2+1)
+      1× → 零模糊, 仅保留压缩伪影链路
+
+    ■ 高阶退化流程 (mode 3/4, 均为 3 阶段) ■
+    ──────────────────────────────────────────
+      Stage 1 (创作者上传): [模糊] → [中间缩放] → 压缩
+      Stage 2 (平台转存):   [Sinc振铃] → [模糊] → 下采样 → DCT偏移 → 压缩
+      Stage 3 (终端获取):   [缩放截图] → DCT偏移 → 最终压缩
+
+      1× 模式: 所有 [方括号] 操作跳过, 退化为纯多轮压缩 + DCT偏移,
+      完美模拟 "原图被多次转存压缩" 的纯伪影退化。
 
     Args:
         mode:         退化模式 (0-4)
-        scale_factor: 下采样倍率
+        scale_factor: 下采样倍率 (1, 2, 4)
     """
 
     INTERPOLATION_METHODS = [Image.NEAREST, Image.BILINEAR, Image.BICUBIC]
 
+    # ── Scale-dependent degradation profiles ──
+    # blur_sigma: PIL GaussianBlur(radius=sigma), 有效核 ≈ (2*ceil(2σ)+1)²
+    # 概率与强度随 scale_factor 缩减, 确保退化强度与信息损失匹配
+    PROFILES = {
+        4: dict(
+            pre_blur_prob=0.30,   pre_blur_sigma=1.0,       # 5×5 ≤ 4+1 ✓
+            stage_blur_prob=0.30, stage_blur_sigma=0.8,
+            sinc_prob=0.15,
+            sinc_omega_lv2=(3*math.pi/4, math.pi),          # 截止 top 25% freq
+            sinc_omega_lv3=(math.pi/2, 3*math.pi/4),
+            sinc_ks_small=(7, 9),  sinc_ks_large=(9, 11),
+            stage1_q=(80, 95),  stage2_q=(60, 85),
+            stage3_q_lv2=(50, 80), stage3_q_lv3=(20, 50),
+            zoom_prob_lv2=0.15, zoom_prob_lv3=0.35,
+            first_stage_scale_min=0.6,
+        ),
+        2: dict(
+            pre_blur_prob=0.15,   pre_blur_sigma=0.5,       # 3×3 ≤ 2+1 ✓
+            stage_blur_prob=0.15, stage_blur_sigma=0.4,
+            sinc_prob=0.10,
+            sinc_omega_lv2=(5*math.pi/6, math.pi),          # 截止 top ~17% freq
+            sinc_omega_lv3=(2*math.pi/3, 5*math.pi/6),
+            sinc_ks_small=(5, 7),  sinc_ks_large=(7, 9),
+            stage1_q=(85, 95),  stage2_q=(70, 90),
+            stage3_q_lv2=(60, 85), stage3_q_lv3=(30, 60),
+            zoom_prob_lv2=0.10, zoom_prob_lv3=0.20,
+            first_stage_scale_min=0.8,
+        ),
+        1: dict(
+            pre_blur_prob=0.0,    pre_blur_sigma=0.0,       # 零模糊
+            stage_blur_prob=0.0,  stage_blur_sigma=0.0,
+            sinc_prob=0.0,                                    # 零振铃
+            sinc_omega_lv2=(math.pi, math.pi),
+            sinc_omega_lv3=(math.pi, math.pi),
+            sinc_ks_small=(5, 7),  sinc_ks_large=(7, 9),
+            stage1_q=(75, 95),  stage2_q=(50, 85),
+            stage3_q_lv2=(40, 75), stage3_q_lv3=(15, 45),
+            zoom_prob_lv2=0.0, zoom_prob_lv3=0.0,            # 零缩放截图
+            first_stage_scale_min=1.0,                        # 无中间缩放
+        ),
+    }
+
     def __init__(self, mode: int = 1, scale_factor: int = 4):
+        assert scale_factor in self.PROFILES, \
+            f"scale_factor 必须为 {set(self.PROFILES.keys())}, 当前: {scale_factor}"
         self.mode = mode
         self.scale_factor = scale_factor
+        self.p = self.PROFILES[scale_factor]
 
     @staticmethod
     def _random_downsample_interp() -> int:
@@ -249,20 +310,26 @@ class DegradationPipeline:
         raise ValueError(f"未知退化模式: {self.mode}")
 
     def _degrade_pure(self, hr: Image.Image, blur: bool) -> Image.Image:
-        """Mode 0/1: 纯下采样, 可选预模糊。"""
+        """Mode 0/1: 纯下采样, 可选预模糊。1× 时返回原图。"""
+        if self.scale_factor <= 1:
+            return hr
         w, h = hr.size
         lr_w, lr_h = w // self.scale_factor, h // self.scale_factor
         if blur and random.random() < 0.5:
-            hr = apply_pre_blur(hr)
+            hr = apply_pre_blur(hr, self.p['pre_blur_sigma'])
         interp = self._random_downsample_interp() if blur else Image.BICUBIC
         return hr.resize((lr_w, lr_h), interp)
 
     def _degrade_light(self, hr: Image.Image) -> Image.Image:
-        """Mode 2: 下采样 + 随机 1-3 次压缩。
-
-        多次压缩模拟图片经多个平台转存的累积退化。
-        """
+        """Mode 2: 下采样 + 随机压缩。1× 时仅压缩。"""
         w, h = hr.size
+        if self.scale_factor <= 1:
+            # 1× 纯去伪影: 仅 1-2 次压缩, 无下采样
+            n_passes = random.choices([1, 2], weights=[7, 3], k=1)[0]
+            img = hr
+            for _ in range(n_passes):
+                img = apply_random_compression(img, random.randint(60, 95))
+            return img
         lr_w, lr_h = w // self.scale_factor, h // self.scale_factor
         lr = hr.resize((lr_w, lr_h), self._random_downsample_interp())
         n_passes = random.choices([1, 2, 3], weights=[3, 5, 2], k=1)[0]
@@ -271,46 +338,68 @@ class DegradationPipeline:
         return lr
 
     def _degrade_high_order(self, hr: Image.Image, level: int) -> Image.Image:
-        """Mode 3/4: 高阶退化, 模拟互联网传播链路。
+        """Mode 3/4: 3 阶段高阶退化 (scale-aware).
 
-        level=2 (mode 3): 2 阶段 — Stage1 创作者上传 + Stage2 平台转存。
-        level=3 (mode 4): 3 阶段 — 额外 Stage3 终端获取 (重度包浆)。
+        level=2 (mode 3): lv2 — "社交媒体转存"
+        level=3 (mode 4): lv3 — "电子包浆"
+
+        所有模糊/缩放操作受 PROFILES 门控:
+          4× → 完整退化链路, σ≤1.0
+          2× → 概率减半, σ≤0.5
+          1× → 全部跳过, 退化为纯多轮压缩 + DCT 偏移
         """
+        p = self.p
         w, h = hr.size
-        lr_w, lr_h = w // self.scale_factor, h // self.scale_factor
+        sf = self.scale_factor
+        lr_w = w // sf if sf > 1 else w
+        lr_h = h // sf if sf > 1 else h
         img = hr
 
-        # === Stage 1: 创作者上传 ===
-        if random.random() < 0.5:
-            img = apply_pre_blur(img)
-        scale = sample_first_stage_scale()
-        if scale < 1.0:
-            img = img.resize((max(lr_w, int(w * scale)),
-                              max(lr_h, int(h * scale))),
-                             self._random_downsample_interp())
-        img = apply_random_compression(img, random.randint(75, 95))
+        # ═══ Stage 1: 创作者上传 ═══
+        if random.random() < p['pre_blur_prob']:
+            img = apply_pre_blur(img, p['pre_blur_sigma'])
 
-        # === Stage 2: 平台转存 ===
-        if random.random() < 0.3:
-            img = apply_sinc_ringing(img, level)
-        if random.random() < 0.5:
-            img = apply_stage_blur(img)
-        img = img.resize((lr_w, lr_h), self._random_downsample_interp())
+        if sf > 1:
+            scale = sample_first_stage_scale(p['first_stage_scale_min'])
+            if scale < 1.0:
+                img = img.resize(
+                    (max(lr_w, int(w * scale)), max(lr_h, int(h * scale))),
+                    self._random_downsample_interp(),
+                )
+
+        img = apply_random_compression(img, random.randint(*p['stage1_q']))
+
+        # ═══ Stage 2: 平台转存 ═══
+        if random.random() < p['sinc_prob']:
+            omega = p['sinc_omega_lv2'] if level == 2 else p['sinc_omega_lv3']
+            ks = p['sinc_ks_small'] if min(img.size) < 128 else p['sinc_ks_large']
+            img = apply_sinc_ringing(img, omega, ks)
+
+        if random.random() < p['stage_blur_prob']:
+            img = apply_stage_blur(img, p['stage_blur_sigma'])
+
+        if sf > 1:
+            img = img.resize((lr_w, lr_h), self._random_downsample_interp())
+
         img, (dy2, dx2) = break_dct_grid(img)
-        img = apply_random_compression(img, random.randint(50, 80))
+        img = apply_random_compression(img, random.randint(*p['stage2_q']))
         img = undo_dct_shift(img, dy2, dx2)
 
-        # === Stage 3: 终端获取 (仅 mode 4 / level=3) ===
-        if level == 3:
-            if random.random() < 0.50 and lr_w > 64:
-                small = random.randint(max(32, lr_w // 2), lr_w - 1)
-                img = img.resize((small, small), self._random_downsample_interp())
-                img = apply_sinc_ringing(img, level)
-                img = img.resize((lr_w, lr_h), random.choice(self.INTERPOLATION_METHODS))
+        # ═══ Stage 3: 终端获取 ═══
+        zoom_prob = p['zoom_prob_lv3'] if level == 3 else p['zoom_prob_lv2']
+        if random.random() < zoom_prob and lr_w > 64:
+            small = random.randint(max(32, lr_w // 2), lr_w - 1)
+            img = img.resize((small, small), self._random_downsample_interp())
+            if p['sinc_prob'] > 0:
+                omega = p['sinc_omega_lv2'] if level == 2 else p['sinc_omega_lv3']
+                img = apply_sinc_ringing(img, omega, p['sinc_ks_small'])
+            img = img.resize((lr_w, lr_h), random.choice(self.INTERPOLATION_METHODS))
 
-            img, (dy3, dx3) = break_dct_grid(img)
-            img = apply_random_compression(img, random.randint(10, 40))
-            img = undo_dct_shift(img, dy3, dx3)
+        q3 = p['stage3_q_lv2'] if level == 2 else p['stage3_q_lv3']
+        img, (dy3, dx3) = break_dct_grid(img)
+        img = apply_random_compression(img, random.randint(*q3))
+        img = undo_dct_shift(img, dy3, dx3)
+
         return img
 
 
@@ -589,33 +678,43 @@ def create_val_dataloader(
 
 
 def verify_dataset(hr_dir: str):
-    """验证数据管线: 各退化模式 + 混合模式 + DataLoader 迭代。"""
+    """验证数据管线: 全倍率 × 全模式 + 混合模式 + DataLoader 迭代。"""
     print("=" * 70)
-    print("  数据管线验证")
+    print("  数据管线验证 (scale-aware)")
     print("=" * 70)
 
-    for mode in range(5):
-        desc = MODE_NAMES.get(mode, '?')
-        print(f"\n■ 模式 {mode}: {desc}")
-        ds = AnimeSRDataset(hr_dir, 512, 4, mode, augment=(mode > 0))
-        print(f"  扫描: {len(ds)} 张")
-        s = ds[0]
-        lr, hr = s['lr'], s['hr']
-        print(f"  LR: {list(lr.shape)}, [{lr.min():.3f}, {lr.max():.3f}]")
-        print(f"  HR: {list(hr.shape)}, [{hr.min():.3f}, {hr.max():.3f}]")
-        assert hr.shape[-1] == lr.shape[-1] * 4
-        assert 0 <= lr.min() and lr.max() <= 1
-        print(f"  ✓ 通过")
+    for sf in [4, 2, 1]:
+        print(f"\n{'─' * 40}")
+        print(f"  scale_factor = {sf}×")
+        print(f"{'─' * 40}")
 
-    print(f"\n■ 混合退化模式:")
-    mixed = CaelumMixedDataset(hr_dir, 512, 4, augment=True)
-    modes_seen = set()
-    for i in range(min(20, len(mixed))):
-        s = mixed[i]
-        modes_seen.add(s['mode'])
-    print(f"  20 次采样覆盖模式: {sorted(modes_seen)}")
+        for mode in range(5):
+            desc = MODE_NAMES.get(mode, '?')
+            print(f"\n  ■ 模式 {mode}: {desc}")
+            ds = AnimeSRDataset(hr_dir, 512, sf, mode, augment=(mode > 0))
+            print(f"    扫描: {len(ds)} 张")
+            s = ds[0]
+            lr, hr = s['lr'], s['hr']
+            print(f"    LR: {list(lr.shape)}, [{lr.min():.3f}, {lr.max():.3f}]")
+            print(f"    HR: {list(hr.shape)}, [{hr.min():.3f}, {hr.max():.3f}]")
+            if sf > 1:
+                assert hr.shape[-1] == lr.shape[-1] * sf, \
+                    f"尺寸不匹配: HR={hr.shape[-1]}, LR={lr.shape[-1]}, scale={sf}"
+            else:
+                assert hr.shape[-1] == lr.shape[-1], \
+                    f"1× 应同尺寸: HR={hr.shape[-1]}, LR={lr.shape[-1]}"
+            assert 0 <= lr.min() and lr.max() <= 1
+            print(f"    ✓ 通过")
 
-    print(f"\n■ DataLoader 迭代:")
+        print(f"\n  ■ 混合退化模式 ({sf}×):")
+        mixed = CaelumMixedDataset(hr_dir, 512, sf, augment=True)
+        modes_seen = set()
+        for i in range(min(20, len(mixed))):
+            s = mixed[i]
+            modes_seen.add(s['mode'])
+        print(f"    20 次采样覆盖模式: {sorted(modes_seen)}")
+
+    print(f"\n■ DataLoader 迭代 (4×):")
     loader = create_train_dataloader(hr_dir, batch_size=4, num_workers=0)
     batch = next(iter(loader))
     print(f"  LR batch: {list(batch['lr'].shape)}")

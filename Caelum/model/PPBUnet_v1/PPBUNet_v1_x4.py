@@ -35,7 +35,7 @@ Architecture — Palette . Painter . Brush
       CornerAwareDCN                                              |  * Brush
       PaletteModulation <-- pal                                   |
         |                                                         |
-        + x_shallow <---------------------------------------------+
+      BaseAnchoredDetailInjector <-- x_shallow --------------------+
         |
       AMADSUpsampler --> SR Output (4x)
 
@@ -46,6 +46,7 @@ Architecture — Palette . Painter . Brush
   ★ MIM + RMA: 互信息提纯跳跃连接 + 超球面流形对齐融合
   ★ HAT: 混合注意力 Transformer (窗口自注意力 + OCAB)
   ★ CornerAwareDCN: 角点感知可变形卷积, 二阶曲率精修
+  ★ BaseAnchoredDetailInjector: 恒等锚定细节注入 (ControlNet Zero-Init)
   ★ PaletteModulation: 全局色彩渲染
   ★ AMADSUpsampler: 各向异性流形感知动态上采样 (坐标偏移 + grid_sample)
 
@@ -585,18 +586,32 @@ class PaletteModulation(nn.Module):
         return feat + self.gamma * fused
 
 
-class CornerAwareDCN(nn.Module):
-    """Corner-Aware Deformable Convolution (角点感知可变形卷积).
-
-    针对发尖、褶皱交界、关节硬轮廓等二阶曲率奇异点,
-    通过隐式角点先验指导 DCNv2 偏移量生成, 采样网格自适应收缩包裹尖端。
-    零初始化 offset + LayerScale 残差, 训练初期等价于标准 3×3 Conv。
-
-    参数:
-        dim:        通道数
-        init_gamma: LayerScale 初始值
+class DensePathExtractor(nn.Module):
     """
+    轻量级残差密集块 (RDB) — 提取拓扑路径上下文。
+    通过密集连接同时持有局部端点与宏观走向的视野。
+    """
+    def __init__(self, dim: int, growth_rate: int = 16):
+        super().__init__()
+        self.conv1 = nn.Sequential(nn.Conv2d(dim, growth_rate, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True))
+        self.conv2 = nn.Sequential(nn.Conv2d(dim + growth_rate, growth_rate, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True))
+        self.conv3 = nn.Sequential(nn.Conv2d(dim + 2 * growth_rate, growth_rate, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True))
+        # 特征压缩融合
+        self.fuse = nn.Conv2d(dim + 3 * growth_rate, dim, 1, 1, 0)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.conv1(x)
+        x2 = self.conv2(torch.cat([x, x1], dim=1))
+        x3 = self.conv3(torch.cat([x, x1, x2], dim=1))
+        out = self.fuse(torch.cat([x, x1, x2, x3], dim=1))
+        return out + x # 残差直连
+
+class CornerAwareDCN(nn.Module):
+    """
+    角点感知可变形卷积 — 路径抽象版。
+    将 RDB 内嵌于偏移量生成器之前，赋予网络对“线条走向”的深刻理解，
+    指导 DCN 精确变形，杜绝发尖粘连。
+    """
     def __init__(self, dim: int, init_gamma: float = 1e-2):
         super().__init__()
         self.dim = dim
@@ -608,7 +623,10 @@ class CornerAwareDCN(nn.Module):
             nn.Sigmoid(),
         )
 
+        self.path_abstractor = DensePathExtractor(dim + 1)
+        
         self.offset_gen = nn.Sequential(
+            self.path_abstractor,
             nn.Conv2d(dim + 1, dim // 2, 3, 1, 1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(dim // 2, 27, 3, 1, 1),
@@ -619,8 +637,7 @@ class CornerAwareDCN(nn.Module):
         self.dcn_weight = nn.Parameter(torch.empty(dim, dim, 3, 3))
         self.dcn_bias = nn.Parameter(torch.zeros(dim))
         nn.init.kaiming_uniform_(self.dcn_weight, a=math.sqrt(5))
-        fan_in = dim * 9
-        bound = 1.0 / math.sqrt(fan_in)
+        bound = 1.0 / math.sqrt(dim * 9)
         nn.init.uniform_(self.dcn_bias, -bound, bound)
 
         self.gamma = nn.Parameter(torch.ones(1, dim, 1, 1) * init_gamma)
@@ -636,6 +653,59 @@ class CornerAwareDCN(nn.Module):
             bias=self.dcn_bias, stride=1, padding=1, mask=mask,
         )
         return x + self.gamma * dcn_out
+
+
+class BaseAnchoredDetailInjector(nn.Module):
+    """
+    基础锚定细节注入器 (Base-Anchored Detail Injector - BADI).
+
+    ■ 第一性原理重构 (跳出零和博弈) ■
+    彻底抛弃 Out = a*Deep + (1-a)*Shallow 的零和门控机制，根除深层特征的"梯度断头台"效应。
+
+    采用坚不可摧的"恒等锚定 (Identity-Anchored)"法则：
+    1. 承重墙直通: 深层纯净特征 (feat_deep) 永远不乘以任何掩码，直接参与加法，
+       保证其永远受到 100% 的重建损失约束，绝无可能发生数值爆炸。
+    2. 跨层细节萃取: 联合深浅特征，提取出一个包含高频边缘的"修补残差"。
+    3. 基底主导门控: 由深层纯净语义自己决定，在什么地方 (线稿) 引入残差，
+       在什么地方 (平坦噪点区) 将残差门控归零。
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+
+        self.detail_extractor = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, kernel_size=3, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=True)
+        )
+
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(dim, dim // 2, kernel_size=3, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(dim // 2, 1, kernel_size=1, bias=True)
+        )
+
+        nn.init.zeros_(self.detail_extractor[-1].weight)
+        nn.init.zeros_(self.detail_extractor[-1].bias)
+
+        nn.init.zeros_(self.spatial_gate[-1].weight)
+        nn.init.constant_(self.spatial_gate[-1].bias, -3.0)
+
+    def forward(self, feat_deep: torch.Tensor, feat_shallow: torch.Tensor) -> torch.Tensor:
+        context = torch.cat([feat_deep, feat_shallow], dim=1)
+        detail_residual = self.detail_extractor(context)
+
+        gate = torch.sigmoid(self.spatial_gate(feat_deep))
+
+        latent_merged = feat_deep + gate * detail_residual
+
+        if self.training:
+            self.last_gate = gate
+            with torch.no_grad():
+                self.last_gate_mean = gate.mean().item()
+                self.last_detail_mag = detail_residual.abs().mean().item()
+
+        return latent_merged
+
 
 
 # ======================================================================
@@ -829,6 +899,7 @@ class PPBUNet(nn.Module):
         print(f"[PPBUNet] 瓶颈: FreqRouter → DC→Palette({num_palette_colors}) / AC→PSMamba×{bn_depth}")
         print(f"[PPBUNet] 解码: RMA + HAT(heads={num_heads}, ws={window_size}, blocks={dec_blocks}) ×{dec_depth}")
         print(f"[PPBUNet] 精修: CornerAwareDCN + PaletteModulation")
+        print(f"[PPBUNet] 融合: BaseAnchoredDetailInjector (Identity-Anchored)")
         print(f"[PPBUNet] 跳连: MIM + RMA")
 
         # === Shallow ===
@@ -902,6 +973,9 @@ class PPBUNet(nn.Module):
         # === Palette Modulation ===
         self.color_render = PaletteModulation(feat_dim=dim_l0, palette_dim=dim_bn)
 
+        # === Base-Anchored Detail Injector ===
+        self.badi = BaseAnchoredDetailInjector(dim=dim_l0)
+
         # === Upsampler ===
         self.upsampler = AdvancedUpsampler(dim_l0, out_channels, scale)
 
@@ -958,7 +1032,7 @@ class PPBUNet(nn.Module):
 
         feat = self.corner_dcn(feat)
         rendered_feat = self.color_render(feat=feat, palette=palette)
-        latent_merged = rendered_feat + x_shallow
+        latent_merged = self.badi(feat_deep=rendered_feat, feat_shallow=x_shallow)
 
         out = self.upsampler(latent_merged)
         return out[:, :, :orig_H * self.scale, :orig_W * self.scale]
