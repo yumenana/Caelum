@@ -14,11 +14,15 @@
 
 <!-- Badges -->
 ![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
+[![GitHub Stars](https://img.shields.io/github/stars/yumenana/Caelum?style=flat&logo=github)](https://github.com/yumenana/Caelum/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/yumenana/Caelum?style=flat&logo=github)](https://github.com/yumenana/Caelum/forks)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)
 ![Code License](https://img.shields.io/badge/code-AGPL--3.0-blue)
 ![Model License](https://img.shields.io/badge/model%20%26%20training-CC%20BY--NC--SA%204.0-lightgrey?logo=creativecommons)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch)
-<!-- TODO: 上传 Release 后替换下方链接 -->
-<!-- ![Release](https://img.shields.io/github/v/release/yumenana/Caelum) -->
+<!-- Release 发布后取消注释下方链接 -->
+<!-- [![Release](https://img.shields.io/github/v/release/yumenana/Caelum)](https://github.com/yumenana/Caelum/releases/latest) -->
+<!-- [![Downloads](https://img.shields.io/github/downloads/yumenana/Caelum/total)](https://github.com/yumenana/Caelum/releases) -->
 
 </div>
 
@@ -34,11 +38,32 @@
 
 ---
 
+## 🔍 横向对比
+
+Caelum 聚焦一个特定的、尚未被充分解决的问题：**还原经历了真实互联网多平台转存链路后的动漫插画**。与通用超分工具不同，Caelum 的训练管线专门模拟图像在 Pixiv、Twitter/X、Facebook、Discord 以及截图循环中的真实退化方式。
+
+| | Caelum | [waifu2x](https://github.com/nagadomi/waifu2x) | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) | [RealCUGAN](https://github.com/bilibili/ailab/tree/main/Real-CUGAN) | [Anime4K](https://github.com/bloc97/Anime4K) |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| **适用内容** | 动漫插画 | 动漫/插画 | 通用/动漫 | 动漫 | 动漫（视频） |
+| **退化模型** | 多平台互联网转存链路 | 噪声 + 模糊 | 真实世界通用 | 噪声 + 压缩 | — |
+| **网络架构** | PPBUNet（U-Net + HAT 注意力 + Mamba） | SwinUNet / CNN | RRDB | U-Net | GLSL 着色器 |
+| **输出倍率** | ×4 | ×1/×2/×4 | ×2/×4 | ×2/×3/×4 | 可变 |
+| **JPEG/WebP 去伪影** | ✅ 多阶段 | ✅ | ✅ | ✅ | — |
+| **推理后端** | DirectML (ONNX) | NCNN / Vulkan | NCNN / CUDA | NCNN | OpenCL / Vulkan |
+| **Windows GUI** | ✅ 原生 | 部分 | 部分 | 部分 | ✅ |
+| **免费** | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+> ⚠️ Caelum 目前正在积极训练中。量化对比指标（PSNR/SSIM/LPIPS）将随第一个稳定 Release 一同发布。
+
+---
+
 ## ✨ 特性
 
 - 🎯 **场景专注** — 专门模拟现代社交/图站平台的真实退化链路（缩放 + JPEG/WebP 压缩），而不是通用退化
 - 🏗️ **PPBUnet** — Palette-Painter-Brush U-Net for Anime Super-Resolution
 - ⚡ **×4 超分** — 主攻 4 倍超分辨率重建
+- 🪟 **Windows GUI** — 开箱即用的 `.exe` 应用，无需 Python 或命令行
+- 🔓 **免费开源** — 永久免费；源代码以 AGPL-3.0 / CC BY-NC-SA 4.0 开放
 
 ---
 

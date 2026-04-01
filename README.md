@@ -14,11 +14,15 @@
 
 <!-- Badges -->
 ![Status](https://img.shields.io/badge/status-active%20development-brightgreen)
+[![GitHub Stars](https://img.shields.io/github/stars/yumenana/Caelum?style=flat&logo=github)](https://github.com/yumenana/Caelum/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/yumenana/Caelum?style=flat&logo=github)](https://github.com/yumenana/Caelum/forks)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)
 ![Code License](https://img.shields.io/badge/code-AGPL--3.0-blue)
 ![Model License](https://img.shields.io/badge/model%20%26%20training-CC%20BY--NC--SA%204.0-lightgrey?logo=creativecommons)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch)
-<!-- TODO: Replace link after Release is published -->
-<!-- ![Release](https://img.shields.io/github/v/release/yumenana/Caelum) -->
+<!-- Uncomment after first Release is published -->
+<!-- [![Release](https://img.shields.io/github/v/release/yumenana/Caelum)](https://github.com/yumenana/Caelum/releases/latest) -->
+<!-- [![Downloads](https://img.shields.io/github/downloads/yumenana/Caelum/total)](https://github.com/yumenana/Caelum/releases) -->
 
 </div>
 
@@ -34,11 +38,32 @@ This is a **×4 super-resolution reconstruction network** specifically targeting
 
 ---
 
+## 🔍 How Does Caelum Compare?
+
+Caelum focuses on a specific, underserved problem: **restoring anime illustrations degraded by real-world internet multi-platform re-upload chains**. Unlike general-purpose upscalers, it is trained exclusively on a simulated pipeline that matches how images actually deteriorate across Pixiv, Twitter/X, Facebook, Discord, and screenshot cycles.
+
+| | Caelum | [waifu2x](https://github.com/nagadomi/waifu2x) | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) | [RealCUGAN](https://github.com/bilibili/ailab/tree/main/Real-CUGAN) | [Anime4K](https://github.com/bloc97/Anime4K) |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| **Target content** | Anime illustration | Anime / Art | General / Anime | Anime | Anime (video) |
+| **Degradation model** | Multi-platform internet re-upload chain | Noise + blur | Real-world general | Noise + compression | — |
+| **Architecture** | PPBUNet (U-Net + HAT Attention + Mamba) | SwinUNet / CNN | RRDB | U-Net | GLSL shader |
+| **Output scale** | ×4 | ×1/×2/×4 | ×2/×4 | ×2/×3/×4 | Variable |
+| **JPEG/WebP artifact removal** | ✅ Multi-stage | ✅ | ✅ | ✅ | — |
+| **Inference backend** | DirectML (ONNX) | NCNN / Vulkan | NCNN / CUDA | NCNN | OpenCL / Vulkan |
+| **Windows GUI** | ✅ Native | Partial | Partial | Partial | ✅ |
+| **Free** | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+> ⚠️ Caelum is in active training. Quantitative comparisons (PSNR/SSIM/LPIPS) will be published with the first stable Release.
+
+---
+
 ## ✨ Features
 
 - 🎯 **Scenario-Focused** — Specifically simulates the real degradation pipeline of modern social/image platforms (resize + JPEG/WebP compression), not generic degradation
 - 🏗️ **PPBUNet** — Palette-Painter-Brush U-Net for Anime Super-Resolution
 - ⚡ **×4 Upscaling** — Dedicated 4× super-resolution reconstruction
+- 🪟 **Windows GUI** — Ready-to-use `.exe` application — no Python or command line needed
+- 🔓 **Free & Open Source** — Free forever; source code available under AGPL-3.0 / CC BY-NC-SA 4.0
 
 ---
 
