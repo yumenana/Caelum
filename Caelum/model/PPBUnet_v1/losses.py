@@ -4,19 +4,20 @@ Loss Functions for Anime Super-Resolution Training
 
 PPBUNet 训练用自包含损失函数库。
 
-12 个子损失覆盖像素、色彩、频域、空间、感知、对抗六个维度,
+13 个子损失覆盖像素、色彩、频域、空间、感知、对抗六个维度,
 按 2 阶段渐进式启用, 由 CaelumLossV2 统一调度。
 
 各损失的职责划分:
-  L1 + Flat     像素对不对 / 色块稳不稳    (空间域像素锚定)
+  L1 + DC       像素对不对 / 色块稳不稳    (Scharr 拓扑能量指数衰减锚定)
   OKLCH + CG    颜色准不准 / 色彩溢不溢    (感知色彩空间)
   Crevice       夹缝色偏修不修              (形态学 + OKLCH)
+  LRT           夹缝拓扑还原不还            (Laplacian 共振 + R^75 余弦 + Charbonnier 强度)
   Histogram     分布偏不偏                  (边缘掩码不对称直方图)
   Gibbs         能量超没超                  (频域单侧天花板)
   STGV          平坦区纯不纯                (形态学硬掩码 + Charbonnier)
   SmoothGradH   渐变顺不顺                  (结构张量带通 + Hessian)
   Angular       线条直不直                  (Farid 梯度角距离)
-  TurningPoint  拐弯尖不尖                  (结构张量角点响应 + 密度衰减空间NMS)
+  TurningPoint  拐弯尖不尖                  (空洞Scharr + 宏观高斯结构张量)
   Perceptual    语义对不对                  (Danbooru ConvNeXt 余弦距离)
   Decoupled D   结构真不真                  (解耦对抗, 纹理免罚)
 
@@ -27,7 +28,7 @@ Components:
     compute_edge_mask                  Local variance -> soft edge mask
 
   Pixel:
-    FlatRegionAwareLoss                Flat-region weighted L1
+    AdaptiveDCAnchorLoss               Scharr topology-energy exponential-decay L1
 
   Color:
     OklchColorLoss                     OKLCH chroma + hue cosine loss
@@ -40,10 +41,12 @@ Components:
     StrictFlatTGVLoss                  Strict flat-region TGV (Charbonnier)
     SmoothGradientHessianLoss          Structure-tensor guided Hessian penalty
     AngularFluencyLoss                 Farid 7x7 gradient angular distance
-    TopologicalSingularityLoss          Structure tensor corner + density-decayed spatial NMS
+    MacroscopicTurningPointLoss         Dilated Scharr + macroscopic Gaussian structure tensor
+    LaplacianResonanceTopologyLoss     Multi-scale Laplacian resonance crevice topology
 
   Gate Regularization:
     GateTolerancePenalty               Masked soft-gating hinge + cosine annealing
+    CommitteeOrthogonalityLoss         Committee spatial mask orthogonality penalty
 
   Perceptual:
     AnimePerceptualLossV2              Danbooru ConvNeXt cosine perceptual
@@ -54,7 +57,7 @@ Components:
     DecoupledGANLoss                   Asymmetric adversarial loss
 
   Combined:
-    CaelumLossV2                       2-phase progressive (12 sub-losses)
+    CaelumLossV2                       2-phase progressive (13 sub-losses)
 
 作者: YumeNana
 """
@@ -136,39 +139,61 @@ def compute_edge_mask(img: torch.Tensor, patch_size: int = 5) -> torch.Tensor:
 # ======================================================================
 
 
-class FlatRegionAwareLoss(nn.Module):
-    """Flat-Region Aware Weighted L1 (平坦区域感知加权 L1).
+class AdaptiveDCAnchorLoss(nn.Module):
+    """Adaptive DC Anchor Loss (自适应直流分量锚定损失).
 
-    基于 GT 局部方差检测纯色区域, 放大其 L1 权重,
-    防止 60-80% 平坦像素的微小误差被边缘像素梯度淹没。
-    与 StrictFlatTGV 互补: TGV 约束梯度→0, 本损失锚定像素值→GT。
+    替代粗糙的方差硬阈值 (FlatRegionAwareLoss)。
+    核心目的: 作为微分动力学系统中的「积分常数锚点」,
+    防止图像 DC 分量 (绝对亮度/底色) 漂移导致 NaN。
+
+    1. 抛弃存在灾难性抵消风险的 E[X²]-E[X]² 局部方差,
+       采用数值极度稳定的 Scharr 梯度幅值衡量拓扑能量。
+    2. 采用连续可导的指数衰减软掩码替代 0/1 硬阈值,
+       消灭损失曲面上的断层撕裂。
+    3. L1 退让法则: 在平涂区施加强大的 L1 锚定; 在边缘/角点区
+       L1 权重自动呈指数级衰减, 防止 L1 模糊边缘,
+       将高频重构权让渡给 AngularFluency 和 TurningPointLoss。
+
+    Weight = detail_weight + flat_weight × exp(-γ × Energy)
+      绝对平坦区 (Energy=0): 权重 = detail_weight + flat_weight (11.0)
+      高频边缘区 (Energy≫0): 权重 ≈ detail_weight (1.0)
 
     Args:
-        patch_size:    局部方差计算窗口
-        flat_weight:   平坦区 L1 权重
-        detail_weight: 细节区 L1 权重
+        flat_weight:   平坦区额外 L1 权重 (默认 10.0)
+        detail_weight: 全局基础 L1 权重 (默认 1.0)
+        decay_gamma:   能量衰减速率 (默认 50.0)
+        eps:           数值安全极小值
     """
 
-    def __init__(self, patch_size: int = 5, flat_weight: float = 10.0,
-                 detail_weight: float = 1.0):
+    def __init__(self, flat_weight: float = 10.0, detail_weight: float = 1.0,
+                 decay_gamma: float = 50.0, eps: float = 1e-6):
         super().__init__()
-        self.patch_size = patch_size
         self.flat_weight = flat_weight
         self.detail_weight = detail_weight
-        self.padding = patch_size // 2
+        self.decay_gamma = decay_gamma
+        self.eps = eps
 
-    def _compute_local_variance(self, img: torch.Tensor) -> torch.Tensor:
-        local_mean = F.avg_pool2d(img, self.patch_size, stride=1,
-                                  padding=self.padding)
-        local_mean_sq = F.avg_pool2d(img ** 2, self.patch_size, stride=1,
-                                     padding=self.padding)
-        local_var = (local_mean_sq - local_mean ** 2).clamp(min=0)
-        return local_var.max(dim=1, keepdim=True)[0]
+        scharr_x = torch.tensor([[-3., 0., 3.],
+                                  [-10., 0., 10.],
+                                  [-3., 0., 3.]], dtype=torch.float32) / 32.0
+        scharr_y = scharr_x.t()
+        self.register_buffer('w_x', scharr_x.view(1, 1, 3, 3).repeat(3, 1, 1, 1))
+        self.register_buffer('w_y', scharr_y.view(1, 1, 3, 3).repeat(3, 1, 1, 1))
+
+    def _compute_topology_energy(self, img: torch.Tensor) -> torch.Tensor:
+        """Scharr 梯度幅值 → 跨通道最大拓扑能量."""
+        img_pad = F.pad(img, (1, 1, 1, 1), mode='reflect')
+        gx = F.conv2d(img_pad, self.w_x, groups=3)
+        gy = F.conv2d(img_pad, self.w_y, groups=3)
+        grad_mag_sq = gx ** 2 + gy ** 2
+        max_energy = grad_mag_sq.max(dim=1, keepdim=True)[0]
+        return torch.sqrt(max_energy + self.eps)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        local_var = self._compute_local_variance(target)
-        flat_mask = (local_var < 1.0 / 255.0).float()
-        weight_map = flat_mask * self.flat_weight + (1 - flat_mask) * self.detail_weight
+        with torch.no_grad():
+            energy_gt = self._compute_topology_energy(target)
+            flat_mask = torch.exp(-self.decay_gamma * energy_gt)
+            weight_map = self.detail_weight + self.flat_weight * flat_mask
         return (torch.abs(pred - target) * weight_map).mean()
 
 
@@ -541,17 +566,17 @@ class AnimePerceptualLossV2(nn.Module):
         loss = torch.tensor(0.0, device=pred.device)
         for name, w in self.layer_weights.items():
             B, C, H, W = pred_feats[name].shape
-            p_flat = pred_feats[name].reshape(B, C, -1)
-            t_flat = target_feats[name].detach().reshape(B, C, -1)
+            p_flat = pred_feats[name].reshape(B, C, -1).float()
+            t_flat = target_feats[name].detach().reshape(B, C, -1).float()
 
-            p_norm = F.normalize(p_flat, p=2, dim=1)
-            t_norm = F.normalize(t_flat, p=2, dim=1)
+            p_norm = F.normalize(p_flat, p=2, dim=1, eps=1e-4)
+            t_norm = F.normalize(t_flat, p=2, dim=1, eps=1e-4)
 
             cos_sim = (p_norm * t_norm).sum(dim=1)
             cos_dist = 1.0 - cos_sim
 
             magnitude = t_flat.norm(p=2, dim=1)
-            mag_weight = magnitude / (magnitude.mean(dim=-1, keepdim=True) + 1e-8)
+            mag_weight = magnitude / (magnitude.mean(dim=-1, keepdim=True) + 1e-4)
 
             loss = loss + w * (cos_dist * mag_weight).mean()
 
@@ -621,7 +646,7 @@ class StrictFlatTGVLoss(nn.Module):
 
     形态学硬掩码隔离纯平涂区, Charbonnier 惩罚 (非 L1) 避免 Adam 极限环震荡,
     一阶+二阶导数联合约束梯度→0, 彻底根治平坦区纹波。
-    与 FlatRegionAwareLoss 互补: TGV 约束梯度=0, Flat 锚定像素值=GT。
+    与 AdaptiveDCAnchorLoss 互补: TGV 约束梯度=0, DC 锚定像素值=GT。
 
     Args:
         alpha1:          一阶变分权重
@@ -708,7 +733,7 @@ class AngularFluencyLoss(nn.Module):
         eps:       数值稳定性极小值
     """
 
-    def __init__(self, threshold: float = 0.05, eps: float = 1e-8):
+    def __init__(self, threshold: float = 0.05, eps: float = 1e-4):
         super().__init__()
         self.threshold = threshold
         self.eps = eps
@@ -749,64 +774,64 @@ class AngularFluencyLoss(nn.Module):
         return (angular_dist * mask).mean()
 
 
-class TopologicalSingularityLoss(nn.Module):
-    """Topological Singularity Loss — Density-Decayed Spatial NMS
-    (拓扑奇异点感知损失 — 密度衰减版).
+class MacroscopicTurningPointLoss(nn.Module):
+    """Macroscopic Turning Point Loss
+    (宏观转折点与曲率感知损失).
 
-    基于"峰值能量占比 (Peak-to-Energy Ratio)"机制, 根除"密度坍塌悖论"。
-    通过计算结构张量角点响应 (C) 的局部空间密度 (E), 施加指数级衰减。
-    - 孤立 "V", "Y": 密度极低, 保留 100% 超级惩罚, 逼迫网络雕刻锋利针尖。
-    - 交叉 "X", "+": 密度中等, 保留中度惩罚, 维持拓扑连通。
-    - 混乱 "#", "$": 密度极高, 指数衰减彻底剥夺惩罚权重,
-      释放梯度压力, 允许网络在密集网格处执行平滑降噪, 防止整体"摆烂"。
+    通过"尺度升维"彻底解决网络利用微观"深-浅-深"鞍点逃逸作弊的顽疾。
+    1. 空洞梯度 (Dilated Gradient): 使用 dilation=2 的 Scharr 算子,
+       物理感受野 5x5, 直接无视单像素高频噪声。
+    2. 宏观张量积分 (Macroscopic Integration): 使用 11x11 (sigma=2.0) 的
+       高斯核积分梯度共方差矩阵。在宏观视角下, 密集纹理("#")的梯度方向
+       互相抵消, C 值自动归零, 免除手工密度衰减;
+       而对于 V/Y 型夹缝, 宏观的两股强梯度交汇将产生极其稳定的强 C 值。
+    3. 对比度绝对免疫: 公式 C = 4*det(S)/trace(S)^2 在数学上严格消除
+       对比度标量, 纯粹约束空间几何拓扑, 强迫网络在发尖处恢复绝对的结构方向。
 
     数学核心:
-      E = AvgPool_{K×K}(C_gt)           局部角点空间密度
-      S = exp(-decay_factor × E)        指数级密度衰减因子
-      W = 1 + β × C_gt × S             密度调制后的动态权重
+      Ix, Iy = DilatedScharr(gray, dilation=2)     空洞梯度场
+      Sxx, Syy, Sxy = Gaussian_11x11(Ix², Iy², IxIy)  宏观张量积分
+      C = 4·det(S) / (trace(S)² + ε)               对比度免疫角点响应
+      W = 1 + β × C_gt                              宏观注意力掩码
 
     Args:
-        beta:           奇异点 L1 放大基准倍数
-        gamma:          弯曲能量回归权重
-        density_kernel: 计算局部密度的窗口大小 (对应 ~3px 半径)
-        decay_factor:   指数衰减陡峭度 (越大对密集区容忍度越低)
-        eps:            数值安全常数
+        beta:  奇异点 L1 放大基准倍数
+        gamma: 弯曲能量回归权重
+        eps:   数值安全常数
     """
+
     def __init__(self, beta: float = 10.0, gamma: float = 2.0,
-                 density_kernel: int = 7, decay_factor: float = 15.0,
                  eps: float = 1e-6):
         super().__init__()
         self.beta = beta
         self.gamma = gamma
-        self.decay_factor = decay_factor
         self.eps = eps
 
-        self.density_kernel = density_kernel
-        self.density_padding = density_kernel // 2
+        scharr = torch.tensor([[-3., 0., 3.],
+                               [-10., 0., 10.],
+                               [-3., 0., 3.]], dtype=torch.float32) / 32.0
+        self.register_buffer('kx', scharr.view(1, 1, 3, 3))
+        self.register_buffer('ky', scharr.T.view(1, 1, 3, 3))
 
-        p = torch.tensor([0.004711, 0.069321, 0.245410, 0.361117,
-                          0.245410, 0.069321, 0.004711], dtype=torch.float32)
-        d = torch.tensor([-0.018708, -0.125376, -0.193091, 0.000000,
-                           0.193091,  0.125376,  0.018708], dtype=torch.float32)
-        self.register_buffer('kx', torch.outer(p, d).view(1, 1, 7, 7))
-        self.register_buffer('ky', torch.outer(d, p).view(1, 1, 7, 7))
-
-        grid = torch.arange(3, dtype=torch.float32) - 1
-        gaussian_1d = torch.exp(-grid ** 2 / (2.0 * 0.5 ** 2))
+        grid = torch.arange(11, dtype=torch.float32) - 5
+        gaussian_1d = torch.exp(-grid ** 2 / (2.0 * 2.0 ** 2))
         g_kernel = torch.outer(gaussian_1d, gaussian_1d)
         g_kernel = g_kernel / g_kernel.sum()
-        self.register_buffer('g_kernel', g_kernel.view(1, 1, 3, 3))
+        self.register_buffer('g_kernel', g_kernel.view(1, 1, 11, 11))
 
-    def _corner_map(self, x: torch.Tensor) -> torch.Tensor:
-        """提取亚像素级角点响应图 C ∈ [0, 1]."""
+    def _macroscopic_corner_map(self, x: torch.Tensor) -> torch.Tensor:
+        """宏观角点响应图 C ∈ [0, 1] (空洞Scharr + 11×11高斯积分)."""
         gray = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
-        gray_pad = F.pad(gray, (3, 3, 3, 3), mode='reflect')
-        Ix = F.conv2d(gray_pad, self.kx)
-        Iy = F.conv2d(gray_pad, self.ky)
 
-        Ixx, Iyy, Ixy = Ix * Ix, Iy * Iy, Ix * Iy
+        gray_pad = F.pad(gray, (2, 2, 2, 2), mode='reflect')
+        Ix = F.conv2d(gray_pad, self.kx, dilation=2)
+        Iy = F.conv2d(gray_pad, self.ky, dilation=2)
 
-        pad_g = (1, 1, 1, 1)
+        Ixx = Ix * Ix
+        Iyy = Iy * Iy
+        Ixy = Ix * Iy
+
+        pad_g = (5, 5, 5, 5)
         Sxx = F.conv2d(F.pad(Ixx, pad_g, mode='reflect'), self.g_kernel)
         Syy = F.conv2d(F.pad(Iyy, pad_g, mode='reflect'), self.g_kernel)
         Sxy = F.conv2d(F.pad(Ixy, pad_g, mode='reflect'), self.g_kernel)
@@ -817,25 +842,112 @@ class TopologicalSingularityLoss(nn.Module):
         return torch.clamp(C, 0.0, 1.0)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        C_pred = self._corner_map(pred)
+        C_pred = self._macroscopic_corner_map(pred)
         with torch.no_grad():
-            C_gt = self._corner_map(target)
-
-            E_gt = F.avg_pool2d(C_gt, kernel_size=self.density_kernel,
-                                stride=1, padding=self.density_padding)
-
-            S_decay = torch.exp(-self.decay_factor * E_gt)
-
-            W_gt = 1.0 + self.beta * C_gt * S_decay
+            C_gt = self._macroscopic_corner_map(target)
+            W_gt = 1.0 + self.beta * C_gt
 
         loss_weighted_l1 = (W_gt * torch.abs(pred - target)).mean()
 
-        loss_bending = (S_decay * (C_pred - C_gt) ** 2).mean()
+        loss_bending = F.mse_loss(C_pred, C_gt)
 
         return loss_weighted_l1 + self.gamma * loss_bending
 
 
-TurningPointLoss = TopologicalSingularityLoss
+class LaplacianResonanceTopologyLoss(nn.Module):
+    """Multi-Scale Laplacian Resonance Topology Loss
+    (多尺度拉普拉斯共振拓扑损失).
+
+    利用空洞卷积构建双尺度第二导数雷达, 对 ≤4px 发尖/夹缝拓扑结构实现无死角覆盖:
+      Scale 1 (dilation=1): 物理跨度 3px, 捕捉 1~2px 极窄发尖与拓扑奇点。
+      Scale 2 (dilation=2): 物理跨度 5px (稀疏采样), 捕捉 3~4px 中等狭缝与交汇区。
+
+    损失由两部分组成:
+      拓扑项: 5×5 Unfold → R^75 零均值 + L2 归一化 → 余弦距离,
+              纯拓扑误差, 免疫亮度/对比度。
+      强度项: Charbonnier 饱和拉普拉斯能量差,
+              intensity_eps=2.0 自然抑制两个极端:
+              - 能量极低 (退化结构消失): 二次惩罚, 不强制重建
+              - 能量极高 (强边缘): 线性饱和, 不引发过锐化
+
+    与其他损失的互补关系:
+      MacroscopicTurningPoint → 管角点尖不尖 (空洞Scharr宏观结构张量)
+      LRT → 管夹缝拓扑还原 + 边缘强度对齐 (Laplacian 共振 + 流形余弦 + Charbonnier)
+
+    Args:
+        patch_size:          Unfold 补丁大小 (默认 5 → R^75 流形空间)
+        resonance_threshold: 拉普拉斯能量阈值, 分离单源边缘与双源共振 (默认 1.5)
+        intensity_weight:    Charbonnier 强度项权重 (默认 0.15)
+        intensity_eps:       Charbonnier 饱和常数, 单位与 Laplacian 能量相同 (默认 2.0)
+        eps:                 数值安全常数
+    """
+
+    def __init__(self, patch_size: int = 5, resonance_threshold: float = 1.5,
+                 intensity_weight: float = 0.15, intensity_eps: float = 2.0,
+                 eps: float = 1e-4):
+        super().__init__()
+        self.patch_size = patch_size
+        self.resonance_threshold = resonance_threshold
+        self.intensity_weight = intensity_weight
+        self.intensity_eps = intensity_eps
+        self.eps = eps
+
+        laplacian = torch.tensor([[ 1.,  1.,  1.],
+                                   [ 1., -8.,  1.],
+                                   [ 1.,  1.,  1.]], dtype=torch.float32)
+        self.register_buffer('lap_kernel',
+                             laplacian.view(1, 1, 3, 3).repeat(3, 1, 1, 1))
+
+    def _compute_multiscale_energy(self, x: torch.Tensor) -> torch.Tensor:
+        """双尺度拉普拉斯能量 max(S1, S2), 适用于任意输入."""
+        x_pad_s1 = F.pad(x, (1, 1, 1, 1), mode='reflect')
+        lap_s1   = F.conv2d(x_pad_s1, self.lap_kernel, groups=3, dilation=1)
+        e_s1     = torch.abs(lap_s1).max(dim=1, keepdim=True)[0]
+
+        x_pad_s2 = F.pad(x, (2, 2, 2, 2), mode='reflect')
+        lap_s2   = F.conv2d(x_pad_s2, self.lap_kernel, groups=3, dilation=2)
+        e_s2     = torch.abs(lap_s2).max(dim=1, keepdim=True)[0]
+
+        return torch.max(e_s1, e_s2)
+
+    def _get_resonance_mask(self, target: torch.Tensor) -> torch.Tensor:
+        """双尺度拉普拉斯共振掩码: max(S1, S2) → sigmoid → 3×3 膨胀."""
+        max_energy = self._compute_multiscale_energy(target)
+        mask       = torch.sigmoid((max_energy - self.resonance_threshold) * 10.0)
+        return F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = pred.shape
+
+        with torch.no_grad():
+            target_energy = self._compute_multiscale_energy(target)
+            mask = torch.sigmoid((target_energy - self.resonance_threshold) * 10.0)
+            mask = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+            if mask.sum() < 1.0:
+                return pred.sum() * 0.0
+            mask_sum = mask.sum().clamp(min=1.0)
+
+        # 拓扑项: R^75 流形余弦距离
+        ps       = self.patch_size
+        p_unfold = F.unfold(pred,   kernel_size=ps, padding=ps // 2)
+        t_unfold = F.unfold(target, kernel_size=ps, padding=ps // 2)
+
+        p_centered = p_unfold - p_unfold.mean(dim=1, keepdim=True)
+        t_centered = t_unfold - t_unfold.mean(dim=1, keepdim=True)
+
+        p_norm = F.normalize(p_centered, p=2, dim=1, eps=self.eps)
+        t_norm = F.normalize(t_centered, p=2, dim=1, eps=self.eps)
+
+        cos_sim   = (p_norm * t_norm).sum(dim=1, keepdim=True).view(B, 1, H, W).clamp(-1.0, 1.0)
+        topo_loss = ((1.0 - cos_sim) * mask).sum() / mask_sum
+
+        # 强度项: Charbonnier 饱和拉普拉斯能量差
+        pred_energy    = self._compute_multiscale_energy(pred)
+        diff           = pred_energy - target_energy
+        charb          = torch.sqrt(diff ** 2 + self.intensity_eps ** 2) - self.intensity_eps
+        intensity_loss = (charb * mask).sum() / mask_sum
+
+        return topo_loss + self.intensity_weight * intensity_loss
 
 
 class SmoothGradientHessianLoss(nn.Module):
@@ -1024,6 +1136,45 @@ class GateTolerancePenalty(nn.Module):
         return weight * loss
 
 
+class CommitteeOrthogonalityLoss(nn.Module):
+    """Committee Spatial Mask Orthogonality Penalty (委员会空间掩码正交互斥损失).
+
+    强迫 AnimeCommitteeRefiner 4 个委员的门控掩码在空间上尽量互斥,
+    防止专家同质化坍塌 (Polisher 与 Detailer 退化为相同功能)。
+
+    原理: 若委员 i 在像素 p 处激活, 惩罚委员 j (j≠i) 也在同一位置激活,
+    相当于在空间上施加软性"施工区域互斥"约束。
+
+    公式:
+        overlap_matrix[b,i,j] = <mask_i_flat, mask_j_flat>
+        Loss = weight × Σ_{i≠j} overlap_matrix[b,i,j] / (B × K × (K-1) × N)
+
+    参数:
+        weight: 损失权重 (建议 0.005 ~ 0.02)
+    """
+
+    def __init__(self, weight: float = 0.01):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, routing_masks: torch.Tensor) -> torch.Tensor:
+        """Args:
+            routing_masks: AnimeCommitteeRefiner 门控掩码 (B, K, H, W), 值域 [0, 1]
+        """
+        B, K, H, W = routing_masks.shape
+        N = H * W
+        masks_flat = routing_masks.view(B, K, N)
+
+        # (B, K, N) @ (B, N, K) -> (B, K, K): 任意两委员的空间点积 (重叠面积)
+        overlap_matrix = torch.bmm(masks_flat, masks_flat.transpose(1, 2))
+
+        # 仅惩罚非对角线元素 (i ≠ j)
+        off_diag = 1.0 - torch.eye(K, device=routing_masks.device).unsqueeze(0)
+        penalty = (overlap_matrix * off_diag).sum() / (B * K * (K - 1) * N)
+
+        return self.weight * penalty
+
+
 # ======================================================================
 # GAN Components (GAN 组件)
 # ======================================================================
@@ -1155,9 +1306,9 @@ class CaelumLossV2(nn.Module):
     self.weights 是公开 dict, 训练循环可随时修改。
     返回 dict: 'total' 为加权总和 (tensor), 其余为原始值 (.item() float)。
 
-    Phase 1 (0% ~ phase_2_start): l1, flat, oklch, stgv, smooth_grad_hessian
-    Phase 2 (phase_2_start ~ 100%): + chroma_grad, crevice, histogram,
-        gibbs, angular, turning_point, perceptual
+    Phase 1 (0% ~ phase_2_start): l1, dc, oklch, stgv, smooth_grad_hessian
+    Phase 2
+        gibbs, angular, turning_point, lrt, perceptual
 
     Args:
         weights:            损失权重字典 (覆盖 DEFAULT_WEIGHTS)
@@ -1173,16 +1324,17 @@ class CaelumLossV2(nn.Module):
 
     DEFAULT_WEIGHTS = {
         'l1':           1.0,
-        'flat':         1.0,
-        'oklch':        4.0,
-        'stgv':         0.1,
-        'chroma_grad':  2.0,
-        'crevice':      4.0,
-        'histogram':    2.0,
-        'gibbs':        16.0,
-        'smooth_grad_hessian': 2.0,
-        'angular':      4.0,
+        'dc':           1.0,
+        'oklch':        5.0,
+        'stgv':         1.0,
+        'chroma_grad':  1.5,
+        'crevice':      6.0,
+        'histogram':    1.5,
+        'gibbs':        4.0,
+        'smooth_grad_hessian': 1.5,
+        'angular':      5.0,
         'turning_point': 1.0,
+        'lrt':          1.5,
         'perceptual':   0.5,
     }
 
@@ -1212,7 +1364,7 @@ class CaelumLossV2(nn.Module):
 
         # === Phase 1 ===
         self.l1_loss = nn.L1Loss()
-        self.flat_loss = FlatRegionAwareLoss()
+        self.flat_loss = AdaptiveDCAnchorLoss()
         self.oklch_loss = OklchColorLoss(oklch_alpha, oklch_beta)
         self.stgv_loss = StrictFlatTGVLoss(stgv_alpha1, stgv_alpha2,
                                               stgv_flat_threshold, stgv_safe_margin)
@@ -1224,7 +1376,9 @@ class CaelumLossV2(nn.Module):
         self.histogram_loss = MaskedAsymmetricHistogramLoss()
         self.gibbs_loss = GibbsRingingPenaltySWT()
         self.angular_loss = AngularFluencyLoss(angular_threshold)
-        self.turning_point_loss = TopologicalSingularityLoss(tp_beta, tp_gamma)
+        self.turning_point_loss = MacroscopicTurningPointLoss(tp_beta, tp_gamma)
+
+        self.lrt_loss = LaplacianResonanceTopologyLoss()
 
         self.perceptual_loss = None
         if self.weights.get('perceptual', 0) > 0:
@@ -1249,13 +1403,13 @@ class CaelumLossV2(nn.Module):
         raw_sgh = self.smooth_grad_hessian_loss(pred, target)
 
         total = (w['l1'] * raw_l1
-                 + w['flat'] * raw_flat
+                 + w['dc'] * raw_flat
                  + w['oklch'] * raw_oklch
                  + w['stgv'] * raw_stgv
                  + w['smooth_grad_hessian'] * raw_sgh)
 
         raw_cg = raw_crv = raw_hist = zero
-        raw_gibbs = raw_angular = raw_tp = raw_perc = zero
+        raw_gibbs = raw_angular = raw_tp = raw_lrt = raw_perc = zero
 
         if phase >= 2:
             raw_cg = self.chroma_grad_loss(pred, target)
@@ -1263,14 +1417,16 @@ class CaelumLossV2(nn.Module):
             raw_hist = self.histogram_loss(pred, target)
             raw_gibbs = self.gibbs_loss(pred, target)
             raw_angular = self.angular_loss(pred, target)
-            raw_tp = self.turning_point_loss(pred, target)
+            raw_tp  = self.turning_point_loss(pred, target)
+            raw_lrt = self.lrt_loss(pred, target)
 
             total = total + (w['chroma_grad'] * raw_cg
                              + w['crevice'] * raw_crv
                              + w['histogram'] * raw_hist
                              + w['gibbs'] * raw_gibbs
                              + w['angular'] * raw_angular
-                             + w['turning_point'] * raw_tp)
+                             + w['turning_point'] * raw_tp
+                             + w['lrt'] * raw_lrt)
 
             if self.perceptual_loss is not None:
                 raw_perc = self.perceptual_loss(pred, target)
@@ -1282,7 +1438,7 @@ class CaelumLossV2(nn.Module):
         return {
             'total': total,
             'l1': _v(raw_l1),
-            'flat': _v(raw_flat),
+            'dc': _v(raw_flat),
             'oklch': _v(raw_oklch),
             'stgv': _v(raw_stgv),
             'smooth_grad_hessian': _v(raw_sgh),
@@ -1292,6 +1448,7 @@ class CaelumLossV2(nn.Module):
             'gibbs': _v(raw_gibbs),
             'angular': _v(raw_angular),
             'turning_point': _v(raw_tp),
+            'lrt': _v(raw_lrt),
             'perceptual': _v(raw_perc),
         }
 
@@ -1399,8 +1556,8 @@ if __name__ == "__main__":
     val_sgh_wavy = sgh(noisy_grad_sgh.clamp(0, 1), grad_sgh)
     print(f"  渐变+波纹:    loss={val_sgh_wavy.item():.6f} (应>0, 波纹被惩罚)")
 
-    print("\n■ TopologicalSingularityLoss:")
-    tp = TopologicalSingularityLoss().to(device)
+    print("\n■ MacroscopicTurningPointLoss:")
+    tp = MacroscopicTurningPointLoss().to(device)
 
     tp_pred = torch.randn(2, 3, 64, 64, device=device).clamp(0, 1).requires_grad_(True)
     val_tp = tp(tp_pred, target)
@@ -1418,24 +1575,40 @@ if __name__ == "__main__":
     cross = torch.zeros(2, 3, 64, 64, device=device)
     cross[:, :, 30:34, :] = 1.0
     cross[:, :, :, 30:34] = 1.0
-    val_tp_corner = tp._corner_map(cross)
+    val_tp_corner = tp._macroscopic_corner_map(cross)
     print(f"  十字交叉 C_max: {val_tp_corner.max().item():.4f} (应>0)")
-
-    with torch.no_grad():
-        C_cross = tp._corner_map(cross)
-        E_cross = F.avg_pool2d(C_cross, kernel_size=tp.density_kernel,
-                               stride=1, padding=tp.density_padding)
-        S_cross = torch.exp(-tp.decay_factor * E_cross)
-        print(f"  十字交叉 S_decay 范围: [{S_cross.min().item():.4f}, {S_cross.max().item():.4f}]")
 
     iso_v = torch.zeros(2, 3, 64, 64, device=device)
     iso_v[:, :, 28:36, 30:34] = 1.0
     with torch.no_grad():
-        C_iso = tp._corner_map(iso_v)
-        E_iso = F.avg_pool2d(C_iso, kernel_size=tp.density_kernel,
-                             stride=1, padding=tp.density_padding)
-        S_iso = torch.exp(-tp.decay_factor * E_iso)
-        print(f"  孤立线段 S_decay 范围: [{S_iso.min().item():.4f}, {S_iso.max().item():.4f}] (应接近1)")
+        C_iso = tp._macroscopic_corner_map(iso_v)
+        C_cross_macro = tp._macroscopic_corner_map(cross)
+        print(f"  十字交叉 C_macro 范围: [{C_cross_macro.min().item():.4f}, {C_cross_macro.max().item():.4f}]")
+        print(f"  孤立线段 C_macro 范围: [{C_iso.min().item():.4f}, {C_iso.max().item():.4f}]")
+
+    print("\n■ LaplacianResonanceTopologyLoss:")
+    lrt = LaplacianResonanceTopologyLoss().to(device)
+
+    lrt_pred = torch.randn(2, 3, 64, 64, device=device).clamp(0, 1).requires_grad_(True)
+    val_lrt = lrt(lrt_pred, target)
+    val_lrt.backward()
+    print(f"  随机对:       loss={val_lrt.item():.6f}, grad={lrt_pred.grad.norm().item():.6f}")
+    lrt_pred.grad.zero_()
+
+    val_lrt_self = lrt(target, target)
+    print(f"  自身比较:     loss={val_lrt_self.item():.6f} (应≈0)")
+
+    flat_lrt = torch.full((2, 3, 64, 64), 0.5, device=device)
+    val_lrt_flat = lrt(flat_lrt, flat_lrt)
+    print(f"  纯平坦:       loss={val_lrt_flat.item():.6f} (应≈0, Laplacian=0)")
+
+    # 1px 夹缝: 两根线紧挨, S1 建设性干涉
+    line_img = torch.zeros(2, 3, 64, 64, device=device)
+    line_img[:, :, :, 28:30] = 1.0
+    line_img[:, :, :, 32:34] = 1.0
+    with torch.no_grad():
+        lrt_mask = lrt._get_resonance_mask(line_img)
+    print(f"  S1 夹缝掩码:  {(lrt_mask > 0.1).sum().item()} px (应>0)")
 
     print("\n■ DecoupledUNetDiscriminatorSN:")
     disc = DecoupledUNetDiscriminatorSN(64).to(device)
@@ -1480,7 +1653,7 @@ if __name__ == "__main__":
     out1 = criterion(v2_pred, v2_target)
     out1['total'].backward()
     print(f"  Phase 1: total={out1['total'].item():.4f} "
-          f"l1={out1['l1']:.4f} flat={out1['flat']:.4f} "
+          f"l1={out1['l1']:.4f} dc={out1['dc']:.4f} "
           f"oklch={out1['oklch']:.4f} stgv={out1['stgv']:.4f} "
           f"sgh={out1['smooth_grad_hessian']:.4f}")
     print(f"           chroma_grad={out1['chroma_grad']} (应=0.0)")
@@ -1492,7 +1665,8 @@ if __name__ == "__main__":
     print(f"  Phase 2: total={out2['total'].item():.4f} "
           f"gibbs={out2['gibbs']:.4f} "
           f"angular={out2['angular']:.4f} "
-          f"tp={out2['turning_point']:.4f} cg={out2['chroma_grad']:.4f}")
+          f"tp={out2['turning_point']:.4f} "
+          f"lrt={out2['lrt']:.4f} cg={out2['chroma_grad']:.4f}")
     v2_pred.grad.zero_()
 
     criterion.weights['l1'] = 0.0

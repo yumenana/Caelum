@@ -147,7 +147,7 @@ The app uses a JSON sidecar localization system. No recompilation is needed — 
 
 ## 🏗️ Architecture
 
-> Current version: **PPBUNet v1.0 (Unit-01)**
+> Current version: **PPBUNet v1.2**
 
 A 2-level U-Net pyramid with a parallel geometry bypass, operating in three stages: **Palette** extracts global color prototypes → **Painter** reconstructs global structure → **Brush** performs geometry refinement and upsampling.
 
@@ -290,7 +290,7 @@ HR Original
 
 ### Loss Function Design
 
-`CaelumLossV2` coordinates **12 sub-losses** spanning pixel, color, frequency, spatial, perceptual, and adversarial dimensions, using a **two-phase progressive activation** strategy.
+`CaelumLossV2` coordinates **13 sub-losses** spanning pixel, color, frequency, spatial, perceptual, and adversarial dimensions, using a **two-phase progressive activation** strategy.
 
 #### Two-Phase Progressive Strategy
 
@@ -311,21 +311,22 @@ Phase 1 lets the network converge to the correct color and pixel distribution; P
 | Loss | Weight | Purpose |
 |------|:---:|------|
 | `L1` | 1.0 | Pixel-level absolute error baseline |
-| `FlatRegionAwareLoss` | 1.0 | Amplifies L1 weight 10× in flat regions, preventing small errors in the 60–80% flat-colored pixels from being drowned out by edge gradients |
-| `OklchColorLoss` | 4.0 | OKLCH perceptual color space: chroma L1 + hue cosine joint constraint, atan2-free |
-| `StrictFlatTGVLoss` | 0.1 | Morphological hard mask isolates flat regions; Charbonnier penalizes 1st+2nd derivatives→0, eliminating flat-area ripple |
-| `SmoothGradientHessianLoss` | 2.0 | Structure-tensor guided Hessian penalty on smooth gradient regions; suppresses color banding and micro-ripple in graduation areas |
+| `AdaptiveDCAnchorLoss` | 1.0 | Scharr gradient energy drives exponential-decay soft weights; amplifies L1 in flat regions, fades in textured regions — eliminates hard-threshold variance instability |
+| `OklchColorLoss` | 5.0 | OKLCH perceptual color space: chroma L1 + hue cosine joint constraint, atan2-free |
+| `StrictFlatTGVLoss` | 1.0 | Morphological hard mask isolates flat regions; Charbonnier penalizes 1st+2nd derivatives→0, eliminating flat-area ripple |
+| `SmoothGradientHessianLoss` | 1.5 | Structure-tensor guided Hessian penalty on smooth gradient regions; suppresses color banding and micro-ripple in graduation areas |
 
 **Phase 2 (added when training progress ≥ 30%)**
 
 | Loss | Weight | Purpose |
 |------|:---:|------|
-| `ChromaGradientLoss` | 2.0 | Sobel directly constrains Oklab a/b chroma gradients to align with GT, preventing color overflow |
-| `CreviceColorLoss` | 4.0 | Morphological closing detects line crevices; corrects hue shift caused by JPEG 4:2:0 chroma subsampling |
-| `MaskedAsymmetricHistogramLoss` | 4.0 | Soft histogram over edge-dilated regions; asymmetric divergence heavily penalizes "hallucinated" colors (×5) while lightly penalizing "unrecovered" detail (×1) |
-| `GibbsRingingPenaltySWT` | 16.0 | Haar SWT three sub-bands (HL/LH/HH) × À Trous multi-scale (d=1,2,4); one-sided penalty on high-frequency overshoot without interfering with normal sharpening |
-| `AngularFluencyLoss` | 4.0 | Farid 7×7 rotation-equivariant operator computes gradient direction angular distance, directly eliminating super-resolution aliasing |
-| `TurningPointLoss` | 1.0 | Structure tensor eigenvalue mapping computes corner response C∈[0,1]; corner L1 amplified β=10× + bending energy MSE |
+| `ChromaGradientLoss` | 1.5 | Sobel directly constrains Oklab a/b chroma gradients to align with GT, preventing color overflow |
+| `CreviceColorLoss` | 6.0 | Morphological closing detects line crevices; corrects hue shift caused by JPEG 4:2:0 chroma subsampling |
+| `MaskedAsymmetricHistogramLoss` | 1.5 | Soft histogram over edge-dilated regions; asymmetric divergence heavily penalizes "hallucinated" colors (×5) while lightly penalizing "unrecovered" detail (×1) |
+| `GibbsRingingPenaltySWT` | 4.0 | Haar SWT three sub-bands (HL/LH/HH) × À Trous multi-scale (d=1,2,4); one-sided penalty on high-frequency overshoot without interfering with normal sharpening |
+| `AngularFluencyLoss` | 5.0 | Farid 7×7 rotation-equivariant operator computes gradient direction angular distance, directly eliminating super-resolution aliasing |
+| `MacroscopicTurningPointLoss` | 0.5 | Dilated Scharr (d=2) + 11×11 Gaussian macroscopic integration; contrast-invariant corner response C = 4·det(S)/trace(S)² |
+| `LaplacianResonanceTopologyLoss` | 1.5 | Dual-scale dilated Laplacian resonance + R^75 cosine topology + Charbonnier intensity; restores crevice topology |
 | `AnimePerceptualLossV2` | 0.5 | Danbooru ConvNeXt cosine manifold distance (stage0+stage1); GT magnitude gating focuses on edge regions |
 
 **GAN Components (optional)**
@@ -403,9 +404,9 @@ Caelum/                            ← Repository root
 
 #### ✅ Completed
 
-- [x] PPBUNet v1.0 architecture design (ParallelOAM · FrequencyRouter · MIM · RMA · HAT · CornerAwareDCN · AMADSUpsampler)
+- [x] PPBUNet v1.2 architecture design (ParallelOAM · FrequencyRouter · MIM · RMA · HAT · CornerAwareDCN · AnimeCommitteeRefiner · SATUpsampler)
 - [x] Multi-platform degradation simulation pipeline (5 modes · 3-stage high-order chain · online real-time generation)
-- [x] Custom loss function system (CaelumLossV2 · 12 sub-losses · two-phase progressive strategy · optional BADI gate regularizer)
+- [x] Custom loss function system (CaelumLossV2 · 13 sub-losses · two-phase progressive strategy · committee orthogonality + BADI gate regularizer)
 - [x] Early checkpoint validation
 
 #### 🔄 In Progress
