@@ -1,5 +1,5 @@
-﻿"""
-PPBUNet v1.0 — Palette-Painter-Brush U-Net for Anime Super-Resolution (x4)
+"""
+PPBUNet v1.4 — Palette-Painter-Brush U-Net for Anime Super-Resolution (x4)
 ===========================================================================
 
 4x super-resolution network for anime illustration restoration.
@@ -10,6 +10,12 @@ Architecture — Palette . Painter . Brush
     [Palette]  Extract the global color scheme from low-frequency features
     [Painter]  Reconstruct structure via attention-driven U-Net decoding
     [Brush]    Refine fine geometry at full resolution and upsample to HR
+
+  v1.4 变更 (vs v1.3):
+    - 删除 AnimeCommitteeRefiner (无功能分化驱动力, 梯度死重)
+    - CMW 从 Decoder L0 之后移入 Decoder L0 中间 (前半 HAT → CMW → 后半 HAT)
+    - 新增 CreviceAuxHead: 训练时在 CMW 输出处直接施加拓扑 loss, 解决梯度淹没
+    - mi_loss (InfoNCE) 已接入训练, MIM 门控不再是死代码
 
   Pipeline:
 
@@ -22,33 +28,36 @@ Architecture — Palette . Painter . Brush
       Encoder: L0 (RCAB x2) -d2- L1 (RCAB x2) -d2       |         |
         |                                               |         |
       +- Bottleneck ----------------------------------+ |         |
-      | FreqRouter -- DC --> PaletteExtractor --> pal | |         |  * Palette
-      |            '- AC --> PSMamba x N              | |         |
+      | FreqRouter -- DC ----+                        | |         |  * Palette
+      |            '- AC --> PSMamba x N --+          | |         |
+      |                                   |           | |         |
       +-----------------------------------------------+ |         |
         |                                               |         |
       +- Decoder -------------------------------------+ |         |
       | MIM+RMA (skip_l1) --> HAT Decoder L1          | |         |  * Painter
-      | MIM+RMA (skip_l0) --> HAT Decoder L0          | |         |
+      | MIM+RMA (skip_l0) --> HAT L0 前半              | |         |
+      | CMW(feat, feat_ac, feat_dc) — 虫洞色彩注入      | |         |  * Palette
+      |   [CreviceAuxHead — 训练辅助监督]               | |         |
+      | HAT L0 后半 → dec_l0_conv                      | |         |
       +-----------------------------------------------+ |         |
         |                                               |         |
-      GeometryFusion <-- ParallelOAM -------------------+         |
-      CornerAwareDCN                                              |  * Brush
-      PaletteModulation <-- pal                                   |
+      TopologyGuidedDCN (OAM-guided, local only) <------+         |  * Brush
         |                                                         |
-      BaseAnchoredDetailInjector <-- x_shallow --------------------+
+      BaseAnchoredDetailInjector <-- x_shallow -------------------+
         |
-      SATUpsampler --> SR Output (4x)
+      SATUpsampler_v2 --> SR Output (4x)
 
 核心模块:
   ★ RepSRBlock: 结构重参数化 (训练多分支, 推理折叠为单 Conv)
   ★ ParallelOAM: 0°/90°/45°/135° 绝对方向基底, 消灭曼哈顿阶梯锯齿
   ★ FrequencyRouter: 频率解耦 → DC 色彩调色盘 + AC PS-Mamba 拓扑追踪
-  ★ MIM + RMA: 互信息提纯跳跃连接 + 超球面流形对齐融合
+  ★ ConnectedManifoldWormhole: 双边流形虫洞 (嵌入 Decoder L0 中间, 直接辅助监督)
+  ★ CreviceAuxHead: CMW 直接拓扑监督 (训练时启用, 推理零开销)
+  ★ MIM + RMA: 互信息提纯跳跃连接 (InfoNCE 已接入) + 超球面流形对齐融合
   ★ HAT: 混合注意力 Transformer (窗口自注意力 + OCAB)
-  ★ CornerAwareDCN: 角点感知可变形卷积, 二阶曲率精修
+  ★ TopologyGuidedDCN: OAM 方向感知 + 拓扑引导局部可变形卷积 (3~5px 几何精修)
   ★ BaseAnchoredDetailInjector: 恒等锚定细节注入 (ControlNet Zero-Init)
-  ★ PaletteModulation: 全局色彩渲染
-  ★ SATUpsampler: 奇异点感知拓扑上采样 (各向异性动态滤波 + PDE 对流注入)
+  ★ SATUpsampler_v2: 奇异点感知拓扑上采样 (各向异性动态滤波 + 隐式多边形渲染)
 
 
 作者: YumeNana
@@ -301,42 +310,125 @@ class FrequencyRouter(nn.Module):
         return feat_dc, feat_ac
 
 
-class ChromaticityPaletteExtractor(nn.Module):
-    """Chromaticity Palette Extractor via Soft K-Means (色彩调色盘提取器).
+class ConnectedManifoldWormhole(nn.Module):
+    """Connected Manifold Wormhole — 双边流形虫洞 (连通域交叉注意力).
 
-    从低频直流分量中通过 Soft K-Means 聚类提取全局色彩原型,
-    归一化保证尺度不变性, 不受推理阶段分辨率变化影响。
+    ■ 第一性原理 ■
+    K-Slot 离散色卡对赛璐璐有效, 但对现代插画的柔渐变/厚涂/光晕是过度简化。
+    128×128 patch 内不存在完整语义, 但存在局部"连通域" — 连续的色彩流形。
+
+    机制: 双边交叉注意力 (Bilateral Cross-Attention)
+    - Key/Value (颜料库): 来自 Bottleneck。feat_ac+坐标 作为 Key, feat_dc 作为 Value
+    - Query (画笔): 来自 Decoder L0。feat_hr+坐标 作为 Query
+
+    自适应行为:
+    - 渐变区: AC 特征平滑 → 注意力由坐标主导 → 等效双线性插值 → 渐变完美保留
+    - 发尖奇点: AC 特征剧变 → 语义项一票否决近邻背景 → 全局检索发根 → 虫洞跃迁
+
+    安全设计:
+    - 独立分支融合 (方案 B): 特征与坐标在 dict_dim 空间加法融合,
+      避免坐标淹没 (2ch vs 256ch), 确保坐标维度有等维表达能力
+    - gamma 微小正数初始化 (1e-4): 打破双零死锁, 训练初期近似恒等透传
+    - F.scaled_dot_product_attention: FlashAttention 优化显存
 
     参数:
-        dim:        通道数
-        num_colors: 色彩原型数量
+        query_dim: 高分辨率特征通道数 (dim_l0)
+        key_dim:   AC 特征通道数 (dim_bn)
+        val_dim:   DC 特征通道数 (dim_bn)
+        dict_dim:  注意力内部维度
     """
 
-    def __init__(self, dim: int, num_colors: int = 16):
+    def __init__(self, query_dim: int, key_dim: int, val_dim: int, dict_dim: int = 64):
         super().__init__()
-        self.num_colors = num_colors
-        self.prototypes = nn.Parameter(torch.randn(1, num_colors, dim) * 0.02)
-        self.temperature = nn.Parameter(torch.ones(1) * 1.0)
+        self.dict_dim = dict_dim
 
-    def forward(self, feat_dc: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = feat_dc.shape
-        x_flat = feat_dc.view(B, C, H * W).transpose(1, 2)
+        # 方案 B: 独立分支加法融合, 消除坐标淹没
+        self.q_feat = nn.Conv2d(query_dim, dict_dim, 1, bias=False)
+        self.q_coord = nn.Conv2d(2, dict_dim, 1, bias=False)
 
-        x_norm = F.normalize(x_flat, dim=-1)
-        proto_norm = F.normalize(self.prototypes, dim=-1)
+        self.k_feat = nn.Conv2d(key_dim, dict_dim, 1, bias=False)
+        self.k_coord = nn.Conv2d(2, dict_dim, 1, bias=False)
 
-        sim = torch.matmul(x_norm, proto_norm.transpose(1, 2)) / self.temperature.clamp(min=0.01)
-        attn = F.softmax(sim, dim=-1)
+        self.v_proj = nn.Conv2d(val_dim, dict_dim, 1, bias=False)
 
-        attn_t = attn.transpose(1, 2)
-        palette_sum = torch.matmul(attn_t, x_flat)
-        attn_weights_sum = attn_t.sum(dim=-1, keepdim=True)
-        palette_normalized = palette_sum / (attn_weights_sum + 1e-6)
+        self.out_proj = nn.Conv2d(dict_dim, query_dim, 1)
+        # 注意: 不零初始化 out_proj!
+        # gamma=0 + out_proj=0 会导致双零梯度死锁:
+        #   gamma 梯度 ∝ out_proj(hint) = 0, out_proj 梯度 ∝ gamma = 0
+        #   两个参数互相等待, 永远无法启动学习。
+        # 保持 Kaiming 默认初始化, 配合小 gamma 保证训练稳定。
 
-        return palette_normalized.mean(dim=1)
+        # Post-Attention LayerNorm (解耦幅度与方向)
+        # 标准 Transformer 做法。不做此操作时, feat_dc 幅度漂移 (无 BN/LN 约束)
+        # 会透传到 color_hint, 迫使 gamma 被动压缩以补偿—— gamma 无法自由增长。
+        # LayerNorm 后 gamma 可以真实反映 CMW 贡献强度。
+        self.color_norm = nn.LayerNorm(dict_dim)
+
+        # 小正数初始化 (非零!) — 打破双零死锁
+        self.gamma = nn.Parameter(torch.ones(1, query_dim, 1, 1) * 1e-4)
+
+    @staticmethod
+    def _generate_coords(B: int, H: int, W: int,
+                         device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """生成归一化到 [-1, 1] 的绝对物理坐标。"""
+        y = torch.linspace(-1, 1, H, device=device, dtype=dtype)
+        x = torch.linspace(-1, 1, W, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(y, x, indexing='ij')
+        return torch.stack([gx, gy], dim=0).unsqueeze(0).expand(B, -1, -1, -1)
+
+    def forward(self, feat_hr: torch.Tensor,
+                feat_ac: torch.Tensor, feat_dc: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            feat_hr: (B, C_q, H, W) — 高分辨率解码器特征 (Query)
+            feat_ac: (B, C_k, h, w) — Bottleneck AC 特征 (Key 语义)
+            feat_dc: (B, C_v, h, w) — Bottleneck DC 特征 (Value 色彩)
+
+        Returns:
+            (B, C_q, H, W) — 色彩注入后的特征
+        """
+        B, C_q, H, W = feat_hr.shape
+        _, _, h, w = feat_ac.shape
+
+        # 1. 物理坐标 (独立分支)
+        coords_hr = self._generate_coords(B, H, W, feat_hr.device, feat_hr.dtype)
+        coords_lr = self._generate_coords(B, h, w, feat_ac.device, feat_ac.dtype)
+
+        # 2. Query = feat_proj + coord_proj (独立投影后加法融合)
+        Q = self.q_feat(feat_hr) + self.q_coord(coords_hr)  # (B, dict_dim, H, W)
+        Q = Q.flatten(2).transpose(1, 2)                     # (B, H*W, dict_dim)
+
+        # 3. Key = feat_proj + coord_proj
+        K = self.k_feat(feat_ac) + self.k_coord(coords_lr)   # (B, dict_dim, h, w)
+        K = K.flatten(2).transpose(1, 2)                     # (B, h*w, dict_dim)
+
+        # 4. Value = DC 色彩特征
+        V = self.v_proj(feat_dc).flatten(2).transpose(1, 2)  # (B, h*w, dict_dim)
+
+        # 5. Scaled Dot-Product Attention (FlashAttention 优化)
+        color_hint = F.scaled_dot_product_attention(Q, K, V)  # (B, H*W, dict_dim)
+
+        # 6. Post-Attention LayerNorm (解耦 V 幅度漂移)
+        # 无此操作时: feat_dc 幅度随训练增长 (norm-free 网络) → color_hint 爆炸
+        # → gamma 被迫缩小补偿, gamma 不再代表 CMW 贡献强度
+        # 有此操作: color_hint 方向保留, 幅度标准化; gamma 可以自由增长
+        color_hint = self.color_norm(color_hint)               # (B, H*W, dict_dim)
+        color_hint = color_hint.transpose(1, 2).reshape(B, self.dict_dim, H, W)
+
+        # 7. 投影并恒等注入
+        out = feat_hr + self.gamma * self.out_proj(color_hint)
+
+        if self.training:
+            with torch.no_grad():
+                hint_mag = color_hint.abs().mean().item()
+                gamma_abs = self.gamma.abs().mean().item()
+                self.last_color_hint_mag = hint_mag
+                self.last_gamma_abs = gamma_abs
+                self.last_cmw_eff = gamma_abs * hint_mag  # 真实有效注入量
+
+        return out
 
 
-# ======================================================================
 # Skip Connection Modules (跳跃连接模块)
 # ======================================================================
 
@@ -550,38 +642,6 @@ class RiemannianManifoldAlignment(nn.Module):
 # ======================================================================
 
 
-class PaletteModulation(nn.Module):
-    """Palette Modulation via LayerScale (色彩调制器).
-
-    将全局调色盘色彩向量投影到特征空间, 以 LayerScale (γ=1e-4)
-    加性融合回重构特征, 无 InstanceNorm 保留绝对色彩信息。
-
-    参数:
-        feat_dim:    空间特征维度
-        palette_dim: 调色盘维度
-    """
-
-    def __init__(self, feat_dim: int, palette_dim: int):
-        super().__init__()
-        self.palette_proj = nn.Sequential(
-            nn.Linear(palette_dim, feat_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.fuse = nn.Sequential(
-            nn.Conv2d(feat_dim * 2, feat_dim, 1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(feat_dim, feat_dim, 3, 1, 1),
-        )
-        self.gamma = nn.Parameter(torch.ones(1, feat_dim, 1, 1) * 1e-4)
-
-    def forward(self, feat: torch.Tensor, palette: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = feat.shape
-        pal = self.palette_proj(palette)
-        pal_map = pal.view(B, C, 1, 1).expand(B, C, H, W)
-        fused = self.fuse(torch.cat([feat, pal_map], dim=1))
-        return feat + self.gamma * fused
-
-
 class DensePathExtractor(nn.Module):
     """
     轻量级残差密集块 (RDB) — 提取拓扑路径上下文。
@@ -602,16 +662,44 @@ class DensePathExtractor(nn.Module):
         out = self.fuse(torch.cat([x, x1, x2, x3], dim=1))
         return out + x # 残差直连
 
-class CornerAwareDCN(nn.Module):
+class TopologyGuidedDCN(nn.Module):
+    """Topology-Guided Local Deformable Convolution
+    (拓扑引导局部可变形卷积: OAM 方向感知 + Brush 几何精修).
+
+    ■ 第一性原理 ■
+    长距离色彩搬运已由 GlobalColorDictionary + HardRoutingRenderer 接管
+    (全局注意力内积, 梯度全局连通, 无 grid_sample 插值污染)。
+
+    TopologyGuidedDCN 现在专注于唯一职责:
+    局部 3~5px 几何精修 — 角点曲率校准、发尖末端锐化。
+
+    流水线:
+      geom_prior → compress(dim→8) → geom_code (方向码)
+      x → corner_prior → topo_map (拓扑热图: 边缘/角点/发尖)
+      [x, topo_map, geom_code] → DensePathExtractor → path_feat
+
+      path_feat → local_head → local_offset+mask → deform_conv2d
+      feat = x + γ · DCN(x)
+
+    参数:
+        dim:      主干通道数
+        geom_dim: OAM 方向先验通道数 (默认 = dim)
     """
-    角点感知可变形卷积 — 路径抽象版。
-    将 RDB 内嵌于偏移量生成器之前，赋予网络对“线条走向”的深刻理解，
-    指导 DCN 精确变形，杜绝发尖粘连。
-    """
-    def __init__(self, dim: int, init_gamma: float = 1e-2):
+
+    def __init__(self, dim: int, geom_dim: int | None = None):
         super().__init__()
         self.dim = dim
+        geom_dim = geom_dim or dim
 
+        # === OAM 方向先验压缩 ===
+        geom_code_ch = max(dim // 8, 4)
+        self.geom_compress = nn.Sequential(
+            nn.Conv2d(geom_dim, geom_code_ch, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.geom_code_ch = geom_code_ch
+
+        # === 共享拓扑骨干 ===
         self.corner_prior = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, bias=False),
             nn.LeakyReLU(0.2, inplace=True),
@@ -619,140 +707,61 @@ class CornerAwareDCN(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.path_abstractor = DensePathExtractor(dim + 1)
-        
-        self.offset_gen = nn.Sequential(
-            self.path_abstractor,
-            nn.Conv2d(dim + 1, dim // 2, 3, 1, 1),
+        # path_ch = x(dim) + topo_map(1) + geom_code(geom_code_ch)
+        path_ch = dim + 1 + geom_code_ch
+        self.path_abstractor = DensePathExtractor(path_ch)
+
+        # === 局部 DCN (Brush — 3~5px 几何精修) ===
+        self.local_head = nn.Sequential(
+            nn.Conv2d(path_ch, dim // 2, 3, 1, 1),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(dim // 2, 27, 3, 1, 1),
+            nn.Conv2d(dim // 2, 27, 3, 1, 1),  # 18 offset + 9 mask
         )
-        nn.init.constant_(self.offset_gen[-1].weight, 0.0)
-        nn.init.constant_(self.offset_gen[-1].bias, 0.0)
+        nn.init.zeros_(self.local_head[-1].weight)
+        nn.init.zeros_(self.local_head[-1].bias)
 
-        self.dcn_weight = nn.Parameter(torch.empty(dim, dim, 3, 3))
-        self.dcn_bias = nn.Parameter(torch.zeros(dim))
-        nn.init.kaiming_uniform_(self.dcn_weight, a=math.sqrt(5))
+        self.local_dcn_weight = nn.Parameter(torch.empty(dim, dim, 3, 3))
+        self.local_dcn_bias = nn.Parameter(torch.zeros(dim))
+        nn.init.kaiming_uniform_(self.local_dcn_weight, a=math.sqrt(5))
         bound = 1.0 / math.sqrt(dim * 9)
-        nn.init.uniform_(self.dcn_bias, -bound, bound)
+        nn.init.uniform_(self.local_dcn_bias, -bound, bound)
 
-        self.gamma = nn.Parameter(torch.ones(1, dim, 1, 1) * init_gamma)
+        self.local_gamma = nn.Parameter(torch.ones(1, dim, 1, 1) * 1e-2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        c_prior = self.corner_prior(x)
-        offset_mask = self.offset_gen(torch.cat([x, c_prior], dim=1))
-        offset = offset_mask[:, :18, :, :]
-        mask = torch.sigmoid(offset_mask[:, 18:, :, :])
-
-        dcn_out = deform_conv2d(
-            input=x, offset=offset, weight=self.dcn_weight,
-            bias=self.dcn_bias, stride=1, padding=1, mask=mask,
-        )
-        return x + self.gamma * dcn_out
-
-
-class AnimeCommitteeRefiner(nn.Module):
-    """Identity-Anchored Committee Refiner (恒等锚定委员会精修器).
-
-    在绝对安全的恒等锚定底座上引入 4 位异构专职委员对已提纯的深层语义进行流形精修。
-    输入仅依赖深层纯净特征 (feat_deep), 彻底隔绝浅层脏数据。
-
-    数学公式:
-        Deep_refined = Deep_orig + Σ_i( σ(Router_i) ⊙ Member_i(Deep_orig) )
-
-    委员分工:
-        委员 0 涂色委员 (Colorist):   1×1 卷积, 专职调整局部色偏与均值漂移
-        委员 1 描边委员 (Inker):       3×3 Depthwise, 专职雕刻高频阶跃线稿
-        委员 2 精修委员 (Polisher):    3×3 空洞卷积 dilation=2, 大感受野结构连贯性
-        委员 3 点缀委员 (Detailer):    3×3 组卷积 groups=4, 提取局部高光与微小拓扑
-
-    安全设计:
-        - 每个委员最后一层零初始化: 训练第 0 步所有委员输出为 0, Deep 特征完整透传
-        - Router 负偏置初始化 (bias=-3.0): Sigmoid(-3.0) ≈ 0.047, 委员近乎休眠
-        - 恒等锚定加法: Deep_orig 无损直通, 保证 100% 梯度畅通
-
-    返回:
-        (feat_refined, gate_sum): gate_sum = (B, 1, H, W), 4 个门控的像素级总干预强度,
-        可直接传入 GateTolerancePenalty 对委员会整体施加平坦区约束。
-
-    参数:
-        dim: 通道数
-    """
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-        self.num_members = 4
-
-        self.members = nn.ModuleList([
-            # 委员 0: 涂色 (1×1 纯通道交互, 修色偏)
-            nn.Sequential(
-                nn.Conv2d(dim, dim, 1, bias=False),
-                nn.GELU(),
-                nn.Conv2d(dim, dim, 1),
-            ),
-            # 委员 1: 描边 (3×3 Depthwise, 高频边缘锐化)
-            nn.Sequential(
-                nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
-                nn.GELU(),
-                nn.Conv2d(dim, dim, 1),
-            ),
-            # 委员 2: 精修 (3×3 dilation=2, 大感受野结构连贯性)
-            nn.Sequential(
-                nn.Conv2d(dim, dim, 3, padding=2, dilation=2, bias=False),
-                nn.GELU(),
-                nn.Conv2d(dim, dim, 1),
-            ),
-            # 委员 3: 点缀 (3×3 groups=4, 局部高光与微小拓扑)
-            nn.Sequential(
-                nn.Conv2d(dim, dim, 3, padding=1, groups=max(dim // 16, 1), bias=False),
-                nn.GELU(),
-                nn.Conv2d(dim, dim, 1),
-            ),
-        ])
-
-        # 零初始化每个委员的最后一层 (训练第 0 步输出为 0, 恒等透传)
-        for member in self.members:
-            nn.init.zeros_(member[-1].weight)
-            nn.init.zeros_(member[-1].bias)
-
-        # 调度室: 为 4 位委员生成逐像素"施工许可证"
-        self.router = nn.Sequential(
-            nn.Conv2d(dim, dim // 2, kernel_size=3, padding=1, bias=True),
-            nn.Mish(inplace=True),
-            nn.Conv2d(dim // 2, self.num_members, kernel_size=3, padding=1, bias=True),
-        )
-        # 负偏置初始化: 第 0 步门控 ≈ 0.047, 委员处于休眠状态
-        nn.init.zeros_(self.router[-1].weight)
-        nn.init.constant_(self.router[-1].bias, -3.0)
-
-    def forward(self, feat_deep: torch.Tensor):
-        """返回 (feat_refined, gate_sum)。
-
-        gate_sum: (B, 1, H, W) — 4 个委员门控的像素级总干预强度,
-        可直接传入 GateTolerancePenalty。
+    def forward(self, x: torch.Tensor, geom_prior: torch.Tensor) -> torch.Tensor:
         """
-        routing_logits = self.router(feat_deep)
-        routing_masks = torch.sigmoid(routing_logits)  # (B, 4, H, W)
+        Args:
+            x:           (B, C, H, W) — 解码器特征
+            geom_prior:  (B, C, H, W) — ParallelOAM 方向先验
 
-        refinement_sum = torch.zeros_like(feat_deep)
-        for i, member in enumerate(self.members):
-            proposal = member(feat_deep)
-            mask_i = routing_masks[:, i:i+1, :, :]
-            refinement_sum = refinement_sum + proposal * mask_i
+        Returns:
+            feat_refined: (B, C, H, W) — 局部几何精修后的特征
+        """
+        # === 拓扑骨干 ===
+        topo_map = self.corner_prior(x)
+        geom_code = self.geom_compress(geom_prior)
+        path_input = torch.cat([x, topo_map, geom_code], dim=1)
+        path_feat = self.path_abstractor(path_input)
 
-        feat_refined = feat_deep + refinement_sum
+        # === 局部 DCN ===
+        local_om = self.local_head(path_feat)
+        local_offset = local_om[:, :18]
+        local_mask = torch.sigmoid(local_om[:, 18:])
 
-        gate_sum = routing_masks.sum(dim=1, keepdim=True)  # (B, 1, H, W)
+        local_dcn = deform_conv2d(
+            input=x, offset=local_offset, weight=self.local_dcn_weight,
+            bias=self.local_dcn_bias, stride=1, padding=1, mask=local_mask,
+        )
+        feat = x + self.local_gamma * local_dcn
 
         if self.training:
-            self.last_gate_sum = gate_sum
-            self.last_routing_masks = routing_masks
             with torch.no_grad():
-                self.last_gate_mean = gate_sum.mean().item()
-                self.last_refinement_mag = refinement_sum.abs().mean().item()
+                self.last_local_offset_mag = local_offset.abs().mean().item()
+                self.last_topo_map_mean = topo_map.mean().item()
 
-        return feat_refined, gate_sum
+        return feat
+
+
 
 
 class BaseAnchoredDetailInjector(nn.Module):
@@ -813,21 +822,104 @@ class BaseAnchoredDetailInjector(nn.Module):
 # ======================================================================
 
 
-class SATUpsampler(nn.Module):
-    """Singularity-Aware Topological Upsampler (奇异点感知拓扑上采样器).
+class ImplicitPolygonInjector(nn.Module):
+    """Implicit Polygon Injector — 隐式多边形奇点渲染器.
 
-    彻底抛弃 grid_sample(Bilinear) 造成的拓扑熔断与 Zero-mean 残差导致的对称性毒药。
+    ■ 第一性原理 ■
+    PDE 对流公式 Δ=v·∇I 在 C⁰ 奇点 (V 字发尖) 处梯度湮灭 (∇I=0),
+    导致无论网络预测多大的速度场, 对流项恒为 0 — 方程在最该发力处自杀。
 
-    1. 各向异性动态滤波 (Anisotropic Dynamic Filtering):
-       为每个 LR 像素预测 S² 个独立且空间异构的 K×K 滤波核。在发尖和夹缝处,
-       网络可自由生成沿边缘切线的各向异性核, 实现 0 混叠的奇异点渲染。
+    破局: 放弃连续域导数, 改用离散域几何切割。
+    数学定理: ReLU 两层 MLP = 多超平面交集 = 分段线性多边形。
+    给网络亚像素相对坐标 (dx, dy), 让 MLP 直接在 S×S 高分辨率网格里
+    "画" 出锐利的多边形夹角, 无需依赖梯度。
+
+    安全设计:
+    - 门控 bias=-3.0 → sigmoid≈0.047, 初始近乎静默, 不干扰平滑流形
+    - MLP 末层零初始化 → 训练初期输出为 0, 基础滤波完整透传
+
+    参数:
+        dim:   特征通道数
+        scale: 上采样因子
+    """
+
+    def __init__(self, dim: int, scale: int = 4):
+        super().__init__()
+        self.scale = scale
+
+        # 门控: 只在奇点/高频拓扑处激活, 绝不干扰平滑流形
+        self.gate = nn.Sequential(
+            nn.Conv2d(dim, dim // 4, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(dim // 4, 1, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        nn.init.constant_(self.gate[-2].bias, -3.0)
+
+        # 隐式多边形渲染 MLP (特征 dim + 坐标 2)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(dim + 2, dim, 1, bias=True),
+            nn.ReLU(inplace=True),  # 核心: ReLU 切割出 C⁰ 锐利边界
+            nn.Conv2d(dim, dim, 1, bias=True),
+        )
+        # 零初始化: 训练初期完全不干预基础滤波
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+        # 预计算固定的亚像素相对坐标网格
+        coords = torch.linspace(-1 + 1 / scale, 1 - 1 / scale, scale)
+        y, x = torch.meshgrid(coords, coords, indexing='ij')
+        self.register_buffer('subpixel_grid', torch.stack([x, y], dim=0))  # (2, S, S)
+
+    def forward(self, feat_lr: torch.Tensor) -> torch.Tensor:
+        """隐式多边形几何残差.
+
+        Args:
+            feat_lr: (B, C, H, W) — 低分辨率特征
+
+        Returns:
+            (B, C, H*S, W*S) — 亚像素级多边形几何残差
+        """
+        B, C, H, W = feat_lr.shape
+        S = self.scale
+
+        # 1. 奇点门控 → 展开到 HR 空间
+        gate_lr = self.gate(feat_lr)  # (B, 1, H, W)
+        gate_hr = gate_lr.repeat_interleave(S, dim=2).repeat_interleave(S, dim=3)
+
+        # 2. LR 特征展开到 HR 空间 (Nearest, 4×4 块内特征一致)
+        feat_hr = feat_lr.repeat_interleave(S, dim=2).repeat_interleave(S, dim=3)
+
+        # 3. 铺设亚像素相对坐标
+        grid_hr = self.subpixel_grid.view(1, 2, S, S).repeat(1, 1, H, W).expand(B, -1, -1, -1)
+
+        # 4. 拼接特征与坐标 → MLP 渲染多边形
+        x = torch.cat([feat_hr, grid_hr], dim=1)
+        residual_hr = self.mlp(x)
+
+        # 5. 门控注入: 仅在发尖/边缘处释放多边形残差
+        out = residual_hr * gate_hr
+
+        if self.training:
+            with torch.no_grad():
+                self.last_gate_mean = gate_lr.mean().item()
+                self.last_residual_mag = residual_hr.abs().mean().item()
+
+        return out
+
+
+class SATUpsampler_v2(nn.Module):
+    """Singularity-Aware Topological Upsampler v2 (奇异点感知拓扑上采样器 v2).
+
+    v1 的 PDE 对流注入 (Δ=v·∇I) 在 C⁰ 奇点处梯度湮灭, 已被根除。
+
+    1. 各向异性动态滤波 (保留, 处理 C^∞ 平滑流形):
+       为每个 LR 像素预测 S² 个独立且空间异构的 K×K 滤波核。
        Softmax 归一化确保滤波核权重和为 1, 绝对保留直流(DC)色彩信息。
 
-    2. PDE 偏微分对流注入 (Advection Detail Injection):
-       利用物理学对流方程替代高频残差加法。
-       网络预测 S² 个亚像素速度场 (vx, vy), 高频细节计算为: Δ = v·∇H。
-       基于梯度的流体推动天生具有非对称性, 只在拓扑边界产生定向推拉,
-       完美解决极窄发尖的对比度崩塌, 且绝对不会在平坦区溢出振铃。
+    2. 隐式多边形注入 (新增, 处理 C⁰ 奇点):
+       ReLU MLP + 亚像素坐标直接 "画" 出锐利多边形夹角,
+       绕过梯度依赖, 在 ∇I=0 的奇点处仍能精确渲染。
 
     参数:
         dim:           通道数
@@ -842,7 +934,7 @@ class SATUpsampler(nn.Module):
         self.k = filter_kernel
         self.n_phases = scale ** 2
 
-        # === 模块一: 各向异性动态滤波核生成器 ===
+        # === 模块一: 各向异性动态滤波核生成器 (处理 C^∞ 平滑流形) ===
         self.filter_gen = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
             nn.GELU(),
@@ -851,31 +943,8 @@ class SATUpsampler(nn.Module):
             nn.Conv2d(dim, self.n_phases * (self.k ** 2), kernel_size=1, bias=False),
         )
 
-        # === 模块二: PDE 对流速度场预测器 ===
-        self.velocity_gen = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
-            nn.GELU(),
-            nn.Conv2d(dim, self.n_phases * 2, kernel_size=1, bias=True),
-        )
-        nn.init.zeros_(self.velocity_gen[-1].weight)
-        nn.init.zeros_(self.velocity_gen[-1].bias)
-
-        # 对流强度可学习缩放因子
-        self.advection_gamma = nn.Parameter(torch.ones(1, 1, 1, 1) * 0.1)
-
-        # Scharr 梯度算子 (预扩展至 dim 通道, 避免 forward 中重复 repeat)
-        scharr = torch.tensor(
-            [[-3., 0., 3.], [-10., 0., 10.], [-3., 0., 3.]],
-            dtype=torch.float32,
-        ) / 32.0
-        self.register_buffer(
-            'scharr_x',
-            scharr.view(1, 1, 3, 3).expand(dim, 1, 3, 3).contiguous(),
-        )
-        self.register_buffer(
-            'scharr_y',
-            scharr.t().contiguous().view(1, 1, 3, 3).expand(dim, 1, 3, 3).contiguous(),
-        )
+        # === 模块二: 隐式多边形注入器 (处理 C⁰ 奇点) ===
+        self.polygon_injector = ImplicitPolygonInjector(dim, scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -899,28 +968,16 @@ class SATUpsampler(nn.Module):
         out_base = out_base.reshape(B, C * self.n_phases, H, W)
         out_base = F.pixel_shuffle(out_base, S)
 
-        # === 2. PDE 偏微分对流残差 (雕刻发尖奇异点) ===
-        velocity = self.velocity_gen(x)
-        velocity = F.pixel_shuffle(velocity, S)
-        v_x = velocity[:, 0:1, :, :]
-        v_y = velocity[:, 1:2, :, :]
+        # === 2. 隐式多边形残差注入 (替代 PDE 对流) ===
+        polygon_residual = self.polygon_injector(x)
 
-        # 计算基础 HR 特征的流形空间梯度
-        out_base_pad = F.pad(out_base, (1, 1, 1, 1), mode='reflect')
-        g_x = F.conv2d(out_base_pad, self.scharr_x, groups=C)
-        g_y = F.conv2d(out_base_pad, self.scharr_y, groups=C)
-
-        # PDE 对流项: Δ = v_x·∇I_x + v_y·∇I_y
-        # 平坦区 ∇I=0 → 对流自动失效; 边缘处速度场单侧推动, 天生非对称
-        advection = v_x * g_x + v_y * g_y
-
-        return out_base + self.advection_gamma * advection
+        return out_base + polygon_residual
 
 
 class AdvancedUpsampler(nn.Module):
-    """SAT-based Upsampler (SAT 上采样器).
+    """SAT-based Upsampler v2 (SAT 上采样器 v2).
 
-    封装 SATUpsampler + PReLU + 尾部 Conv 输出 RGB。
+    封装 SATUpsampler_v2 + PReLU + 尾部 Conv 输出 RGB。
 
     参数:
         dim:          特征维度
@@ -936,7 +993,7 @@ class AdvancedUpsampler(nn.Module):
             self.up = nn.Identity()
         elif scale in (2, 4):
             self.up = nn.Sequential(
-                SATUpsampler(dim, scale=scale, filter_kernel=5),
+                SATUpsampler_v2(dim, scale=scale, filter_kernel=5),
                 nn.PReLU(dim),
             )
         else:
@@ -950,6 +1007,34 @@ class AdvancedUpsampler(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.tail(self.up(x))
+
+
+class CreviceAuxHead(nn.Module):
+    """CMW 辅助监督头 — 训练时在 CMW 输出处直接施加拓扑 loss.
+
+    ■ 设计目的 ■
+    CMW 的 gamma 在 v1.3 中始终 ≈ 0, 500ep 不激活。
+    根因: 拓扑 loss (LRT, Crevice) 的梯度经 40+ 层反传后被 L1/DC 的均匀梯度淹没,
+    CMW 从未收到有效的驱动信号。
+
+    解决方案: 在 CMW 输出处直接施加辅助监督 (deep supervision),
+    拓扑 loss 的梯度只需穿过 1 层 Conv 即可到达 CMW。
+
+    极简结构: 1×1 投影 + PixelShuffle 上采样到 HR → 3ch RGB。
+    推理时不使用, 零额外开销。
+
+    参数:
+        dim:   特征通道数
+        scale: 上采样因子
+    """
+
+    def __init__(self, dim: int, scale: int = 4):
+        super().__init__()
+        self.scale = scale
+        self.proj = nn.Conv2d(dim, 3 * scale ** 2, 1, bias=True)
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(F.pixel_shuffle(self.proj(feat), self.scale))
 
 
 # ======================================================================
@@ -976,7 +1061,8 @@ class PPBUNet(nn.Module):
         window_size: int = 8,
         num_heads: int = 4,
         ssm_d_state: int = 16,
-        num_palette_colors: int = 16,
+        num_color_slots: int = 32,
+        dict_dim: int = 64,
         split_levels: tuple = (1, 2, 4),
         use_checkpoint: bool = True,
     ):
@@ -992,16 +1078,21 @@ class PPBUNet(nn.Module):
         dec_depth = max(num_hat_groups, 2)
         dec_blocks = max(num_hat_blocks_per_group, 2)
 
-        print(f"[PPBUNet] v1.1 — Palette-Painter-Brush U-Net")
+        dec_l0_pre_depth = dec_depth // 2
+        dec_l0_post_depth = dec_depth - dec_l0_pre_depth
+
+        print(f"[PPBUNet] v1.4 — Palette-Painter-Brush U-Net (Optimized)")
         print(f"[PPBUNet] 维度: L0={dim_l0}, L1={dim_l1}, BN={dim_bn}")
         print(f"[PPBUNet] 深度: Enc=2+2, BN(AC)={bn_depth}, Dec={dec_depth}+{dec_depth}")
-        print(f"[PPBUNet] 上采样: SATUpsampler {scale}x")
+        print(f"[PPBUNet] 上采样: SATUpsampler_v2 {scale}x (各向异性滤波 + 隐式多边形)")
         print(f"[PPBUNet] 旁路: ParallelOAM (0°/90°/45°/135°)")
-        print(f"[PPBUNet] 瓶颈: FreqRouter → DC→Palette({num_palette_colors}) / AC→PSMamba×{bn_depth}")
+        print(f"[PPBUNet] 瓶颈: FreqRouter → DC/AC → PSMamba×{bn_depth}")
         print(f"[PPBUNet] 解码: RMA + HAT(heads={num_heads}, ws={window_size}, blocks={dec_blocks}) ×{dec_depth}")
-        print(f"[PPBUNet] 精修: CornerAwareDCN + PaletteModulation + AnimeCommitteeRefiner")
+        print(f"[PPBUNet] CMW: 嵌入 Decoder L0 中间 (前{dec_l0_pre_depth}+后{dec_l0_post_depth}组 HAT, dict_dim={dict_dim})")
+        print(f"[PPBUNet] 辅助: CreviceAuxHead (训练时直接监督 CMW, 推理零开销)")
+        print(f"[PPBUNet] 精修: TopologyGuidedDCN (OAM local)")
         print(f"[PPBUNet] 融合: BaseAnchoredDetailInjector (Identity-Anchored)")
-        print(f"[PPBUNet] 跳连: MIM + RMA")
+        print(f"[PPBUNet] 跳连: MIM (InfoNCE) + RMA")
 
         # === Shallow ===
         self.shallow = nn.Sequential(
@@ -1029,7 +1120,9 @@ class PPBUNet(nn.Module):
 
         # === Bottleneck ===
         self.freq_router = FrequencyRouter(dim_bn, kernel_size=5)
-        self.palette_extractor = ChromaticityPaletteExtractor(dim_bn, num_palette_colors)
+        self.cmw = ConnectedManifoldWormhole(
+            query_dim=dim_l0, key_dim=dim_bn, val_dim=dim_bn, dict_dim=dict_dim,
+        )
         self.bottleneck_ac = nn.Sequential(
             *[PSMambaBlock(dim_bn, d_state=ssm_d_state, split_levels=split_levels)
               for _ in range(bn_depth)]
@@ -1050,32 +1143,30 @@ class PPBUNet(nn.Module):
         )
         self.dec_l1_conv = nn.Conv2d(dim_l1, dim_l1, 3, 1, 1)
 
-        # === Decoder L0 ===
+        # === Decoder L0 (split for mid-decoder CMW insertion) ===
         self.fuse_0 = RiemannianManifoldAlignment(enc_dim=dim_l0, dec_dim=dim_l1, out_dim=dim_l0)
-        self.dec_l0 = nn.Sequential(
+        self.dec_l0_pre = nn.Sequential(
             *[ResidualHybridAttentionGroup(
                 dim_l0, num_heads,
                 num_blocks=dec_blocks, window_size=window_size,
-              ) for _ in range(dec_depth)]
+              ) for _ in range(dec_l0_pre_depth)]
+        )
+        self.dec_l0_post = nn.Sequential(
+            *[ResidualHybridAttentionGroup(
+                dim_l0, num_heads,
+                num_blocks=dec_blocks, window_size=window_size,
+              ) for _ in range(dec_l0_post_depth)]
         )
         self.dec_l0_conv = nn.Conv2d(dim_l0, dim_l0, 3, 1, 1)
 
-        # === Geometry Fusion ===
-        self.geom_fusion = nn.Sequential(
-            nn.Conv2d(dim_l0 * 2, dim_l0, kernel_size=1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(dim_l0, dim_l0, kernel_size=3, padding=1, bias=False),
-        )
-        self.geom_gamma = nn.Parameter(torch.ones(1, dim_l0, 1, 1) * 1e-2)
+        # === Topology-Guided DCN (OAM 方向感知 + 局部几何精修) ===
+        self.topo_dcn = TopologyGuidedDCN(dim_l0, geom_dim=dim_l0)
 
-        # === Corner-Aware DCN ===
-        self.corner_dcn = CornerAwareDCN(dim_l0, init_gamma=1e-2)
+        # === Connected Manifold Wormhole (嵌入 Decoder L0 中间) ===
+        # CMW 已在 Bottleneck 段实例化 (self.cmw), 此处标注其架构位置
 
-        # === Palette Modulation ===
-        self.color_render = PaletteModulation(feat_dim=dim_l0, palette_dim=dim_bn)
-
-        # === Identity-Anchored Committee Refiner ===
-        self.committee = AnimeCommitteeRefiner(dim=dim_l0)
+        # === Crevice Auxiliary Supervision Head (训练时直接监督 CMW, 推理零开销) ===
+        self.aux_head = CreviceAuxHead(dim_l0, scale)
 
         # === Base-Anchored Detail Injector ===
         self.badi = BaseAnchoredDetailInjector(dim=dim_l0)
@@ -1112,7 +1203,6 @@ class PPBUNet(nn.Module):
 
         bn_in = feat
         feat_dc, feat_ac = self.freq_router(feat)
-        palette = self.palette_extractor(feat_dc)
         feat_ac = self.bottleneck_ac(feat_ac)
         feat = self.bn_conv(feat_ac) + bn_in
 
@@ -1128,16 +1218,19 @@ class PPBUNet(nn.Module):
 
         feat = self.fuse_0(feat_enc=skip_l0, feat_dec=feat)
         dec0_in = feat
-        feat = self.dec_l0(feat)
+        feat = self.dec_l0_pre(feat)
+        feat = self.cmw(feat, feat_ac, feat_dc)
+
+        # Auxiliary crevice supervision: 拓扑 loss 直达 CMW (训练时)
+        if self.training:
+            aux = self.aux_head(feat)
+            self.aux_sr = aux[:, :, :orig_H * self.scale, :orig_W * self.scale]
+
+        feat = self.dec_l0_post(feat)
         feat = self.dec_l0_conv(feat) + dec0_in
 
-        geom_fused = self.geom_fusion(torch.cat([feat, geom_prior], dim=1))
-        feat = feat + self.geom_gamma * geom_fused
-
-        feat = self.corner_dcn(feat)
-        rendered_feat = self.color_render(feat=feat, palette=palette)
-        rendered_feat, _ = self.committee(rendered_feat)
-        latent_merged = self.badi(feat_deep=rendered_feat, feat_shallow=x_shallow)
+        feat = self.topo_dcn(feat, geom_prior)
+        latent_merged = self.badi(feat_deep=feat, feat_shallow=x_shallow)
 
         out = self.upsampler(latent_merged)
         return out[:, :, :orig_H * self.scale, :orig_W * self.scale]
@@ -1154,13 +1247,13 @@ if __name__ == "__main__":
         in_channels=3, out_channels=3, dim=64, scale=4,
         num_ps_mamba_blocks=4, num_hat_groups=4,
         num_hat_blocks_per_group=6, window_size=8, num_heads=4,
-        ssm_d_state=16, num_palette_colors=16, split_levels=(1, 2, 4),
+        ssm_d_state=16, num_color_slots=32, dict_dim=64, split_levels=(1, 2, 4),
         use_checkpoint=True,
     )
 
     model = PPBUNet(**cfg)
     print("=" * 60)
-    print("  PPBUNet v1.1 — Functional Validation")
+    print("  PPBUNet v1.4 — Functional Validation")
     print("=" * 60)
     print(f"  Trainable params : {count_params(model):,} ({count_params(model)/1e6:.2f}M)")
     print(f"  Upscale factor   : {cfg['scale']}x")
@@ -1191,14 +1284,22 @@ if __name__ == "__main__":
     print(f"  InfoNCE loss     : {model.mi_loss.item():.6f}")
 
     print()
-    print("  --- AnimeCommitteeRefiner Diagnostics ---")
-    cmt = model.committee
-    print(f"  gate_mean        : {cmt.last_gate_mean:.6f}  (expect ≈ 4 × 0.047 = 0.19)")
-    print(f"  refinement_mag   : {cmt.last_refinement_mag:.6f}  (expect ≈ 0 at init)")
-    gate_sum_shape = tuple(cmt.last_gate_sum.shape)
-    print(f"  gate_sum shape   : {gate_sum_shape}  (expect (1, 1, H, W))")
-    masks_shape = tuple(cmt.last_routing_masks.shape)
-    print(f"  routing_masks    : {masks_shape}  (expect (1, 4, H, W))")
+    print("  --- CreviceAuxHead Diagnostics ---")
+    aux_sr = model.aux_sr
+    print(f"  aux_sr shape     : {tuple(aux_sr.shape)}  (expect (1, 3, {32*s}, {32*s}))")
+    print(f"  aux_sr range     : [{aux_sr.min().item():.4f}, {aux_sr.max().item():.4f}]  (expect [0, 1])")
+
+    print()
+    print("  --- TopologyGuidedDCN Diagnostics ---")
+    td = model.topo_dcn
+    print(f"  local_offset_mag   : {td.last_local_offset_mag:.6f}  (expect ≈ 0 at init)")
+    print(f"  topo_map_mean      : {td.last_topo_map_mean:.6f}")
+
+    print()
+    print("  --- ConnectedManifoldWormhole Diagnostics ---")
+    cmw = model.cmw
+    print(f"  color_hint_mag   : {cmw.last_color_hint_mag:.6f}  (wormhole output magnitude)")
+    print(f"  gamma_abs        : {cmw.last_gamma_abs:.6f}  (expect 1e-4 at init)")
 
     model.eval()
     print()

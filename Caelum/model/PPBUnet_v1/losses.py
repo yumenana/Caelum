@@ -1,4 +1,4 @@
-﻿"""
+"""
 Loss Functions for Anime Super-Resolution Training
 ===================================================
 
@@ -46,7 +46,6 @@ Components:
 
   Gate Regularization:
     GateTolerancePenalty               Masked soft-gating hinge + cosine annealing
-    CommitteeOrthogonalityLoss         Committee spatial mask orthogonality penalty
 
   Perceptual:
     AnimePerceptualLossV2              Danbooru ConvNeXt cosine perceptual
@@ -150,27 +149,35 @@ class AdaptiveDCAnchorLoss(nn.Module):
        采用数值极度稳定的 Scharr 梯度幅值衡量拓扑能量。
     2. 采用连续可导的指数衰减软掩码替代 0/1 硬阈值,
        消灭损失曲面上的断层撕裂。
-    3. L1 退让法则: 在平涂区施加强大的 L1 锚定; 在边缘/角点区
-       L1 权重自动呈指数级衰减, 防止 L1 模糊边缘,
+    3. L1 退让法则: 在平涂区施加强大的锚定; 在边缘/角点区
+       权重自动呈指数级衰减, 防止模糊边缘,
        将高频重构权让渡给 AngularFluency 和 TurningPointLoss。
+    4. Charbonnier 替代 L1: sqrt(diff² + eps²) - eps,
+       消除 AdamW 在 |diff| ≈ 0 时的极限环振荡 (H7)。
+       当 |diff| >> eps 时行为与 L1 一致,
+       当 |diff| → 0 时梯度平滑衰减到 0, 自然收敛。
 
     Weight = detail_weight + flat_weight × exp(-γ × Energy)
       绝对平坦区 (Energy=0): 权重 = detail_weight + flat_weight (11.0)
       高频边缘区 (Energy≫0): 权重 ≈ detail_weight (1.0)
 
     Args:
-        flat_weight:   平坦区额外 L1 权重 (默认 10.0)
-        detail_weight: 全局基础 L1 权重 (默认 1.0)
+        flat_weight:   平坦区额外权重 (默认 10.0)
+        detail_weight: 全局基础权重 (默认 1.0)
         decay_gamma:   能量衰减速率 (默认 50.0)
+        charb_eps:     Charbonnier eps (默认 1/255, 对应 H7 的 1 像素底线)
         eps:           数值安全极小值
     """
 
     def __init__(self, flat_weight: float = 10.0, detail_weight: float = 1.0,
-                 decay_gamma: float = 50.0, eps: float = 1e-6):
+                 decay_gamma: float = 50.0, charb_eps: float = 1.0 / 255.0,
+                 eps: float = 1e-6):
         super().__init__()
         self.flat_weight = flat_weight
         self.detail_weight = detail_weight
         self.decay_gamma = decay_gamma
+        self.charb_eps_sq = charb_eps ** 2
+        self.charb_eps = charb_eps
         self.eps = eps
 
         scharr_x = torch.tensor([[-3., 0., 3.],
@@ -194,7 +201,10 @@ class AdaptiveDCAnchorLoss(nn.Module):
             energy_gt = self._compute_topology_energy(target)
             flat_mask = torch.exp(-self.decay_gamma * energy_gt)
             weight_map = self.detail_weight + self.flat_weight * flat_mask
-        return (torch.abs(pred - target) * weight_map).mean()
+        diff = pred - target
+        # Charbonnier: sqrt(diff² + eps²) - eps → 消除 L1 在 diff≈0 的极限环
+        charb = torch.sqrt(diff ** 2 + self.charb_eps_sq) - self.charb_eps
+        return (charb * weight_map).mean()
 
 
 # ======================================================================
@@ -242,11 +252,19 @@ class OklchColorLoss(nn.Module):
 class ChromaGradientLoss(nn.Module):
     """Oklab Chroma Gradient Alignment Loss (Oklab 色度梯度对齐损失).
 
-    Sobel 梯度直接约束色度边缘的位置和强度与 GT 对齐, 抗色彩溢出。
+    约束 Oklab a/b 通道的梯度向量 (∇_x, ∇_y) 与 GT 严格对齐。
+
+    使用向量 L1 差: |∇_x_pred - ∇_x_gt| + |∇_y_pred - ∇_y_gt|
+    而非旧版幅值差 ||∇_pred| - |∇_gt||。
+
+    向量比较的关键优势:
+      旧版: |∇a| 只比较色度梯度大小, 红色条纹与蓝色条纹产生
+            同等幅值的 ∇a (但方向相反) → old loss ≈ 0 → 无法惩罚色相错误
+      新版: ∇_x/y 分量直接相减, 红→蓝方向反转时 loss = 2×|∇a| → 强惩罚
 
     Args:
-        a_weight: Oklab a 轴权重
-        b_weight: Oklab b 轴权重
+        a_weight: Oklab a 轴 (绿-红) 梯度权重
+        b_weight: Oklab b 轴 (蓝-黄) 梯度权重
     """
 
     def __init__(self, a_weight: float = 1.0, b_weight: float = 1.0):
@@ -262,21 +280,28 @@ class ChromaGradientLoss(nn.Module):
         self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
         self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
 
-    def _get_gradient(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _get_grad_components(self, tensor: torch.Tensor):
+        """返回 (gx, gy) 有符号分量, 不做 abs。"""
         gx = F.conv2d(tensor, self.sobel_x, padding=1)
         gy = F.conv2d(tensor, self.sobel_y, padding=1)
-        return torch.abs(gx) + torch.abs(gy)
+        return gx, gy
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred_lab = self.rgb_to_oklab(pred)
+        pred_lab   = self.rgb_to_oklab(pred)
         target_lab = self.rgb_to_oklab(target)
 
-        loss_a = torch.abs(
-            self._get_gradient(pred_lab[:, 1:2]) - self._get_gradient(target_lab[:, 1:2])
-        ).mean()
-        loss_b = torch.abs(
-            self._get_gradient(pred_lab[:, 2:3]) - self._get_gradient(target_lab[:, 2:3])
-        ).mean()
+        # a 轴 (绿-红): 向量差
+        p_ax, p_ay = self._get_grad_components(pred_lab[:, 1:2])
+        with torch.no_grad():
+            t_ax, t_ay = self._get_grad_components(target_lab[:, 1:2])
+        loss_a = (torch.abs(p_ax - t_ax) + torch.abs(p_ay - t_ay)).mean()
+
+        # b 轴 (蓝-黄): 向量差
+        p_bx, p_by = self._get_grad_components(pred_lab[:, 2:3])
+        with torch.no_grad():
+            t_bx, t_by = self._get_grad_components(target_lab[:, 2:3])
+        loss_b = (torch.abs(p_bx - t_bx) + torch.abs(p_by - t_by)).mean()
+
         return loss_a * self.a_weight + loss_b * self.b_weight
 
 
@@ -727,15 +752,20 @@ class AngularFluencyLoss(nn.Module):
     使用 Farid 7×7 旋转等变微分算子 (任意角度精度一致),
     余弦角距离 (连续有界, 无 atan2 ±π 奇点)。
     GT 幅值 sigmoid 掩码: 边缘→1 平坦→0, 与 StrictFlatTGV 领域零重叠。
+    edge_ceiling 形成带通: 仅中等边缘 (threshold < |∇| < edge_ceiling) 激活,
+    极端硬边缘 (动漫 255→0 画笔) 被抑制, 不再强迫网络匹配不可重建的阶跃方向。
 
     Args:
-        threshold: GT 梯度幅值激活阈值
-        eps:       数值稳定性极小值
+        threshold:    GT 梯度幅值激活阈值 (下限)
+        edge_ceiling: GT 梯度幅值软天花板 (上限), 与 MacroTP 一致
+        eps:          数值稳定性极小值
     """
 
-    def __init__(self, threshold: float = 0.05, eps: float = 1e-4):
+    def __init__(self, threshold: float = 0.05, edge_ceiling: float = 0.3,
+                 eps: float = 1e-4):
         super().__init__()
         self.threshold = threshold
+        self.edge_ceiling = edge_ceiling
         self.eps = eps
 
         p = torch.tensor([0.004711, 0.069321, 0.245410, 0.361117,
@@ -760,7 +790,10 @@ class AngularFluencyLoss(nn.Module):
         with torch.no_grad():
             t_gx, t_gy = self._get_gradients(target)
             t_mag = torch.sqrt(t_gx ** 2 + t_gy ** 2 + self.eps)
-            mask = torch.sigmoid((t_mag - self.threshold) * 500.0)
+            low_gate = torch.sigmoid((t_mag - self.threshold) * 500.0)
+            high_gate = 1.0 - torch.sigmoid(
+                (t_mag - self.edge_ceiling) * 20.0)
+            mask = low_gate * high_gate
             t_dir_x = t_gx / t_mag
             t_dir_y = t_gy / t_mag
 
@@ -792,19 +825,23 @@ class MacroscopicTurningPointLoss(nn.Module):
       Ix, Iy = DilatedScharr(gray, dilation=2)     空洞梯度场
       Sxx, Syy, Sxy = Gaussian_11x11(Ix², Iy², IxIy)  宏观张量积分
       C = 4·det(S) / (trace(S)² + ε)               对比度免疫角点响应
-      W = 1 + β × C_gt                              宏观注意力掩码
+      S = 1 - σ(|∇I_gt| - edge_ceiling)             极端硬边缘抑制
+      W = 1 + β × C_gt × S                          抑制后注意力掩码
 
     Args:
-        beta:  奇异点 L1 放大基准倍数
-        gamma: 弯曲能量回归权重
-        eps:   数值安全常数
+        beta:          奇异点 L1 放大基准倍数
+        gamma:         弯曲能量回归权重
+        edge_ceiling:  GT 梯度幅值软天花板 (Scharr/32 归一化, 默认 0.3)
+                       超过此值的硬边缘 (如动漫 255→0 画笔) 权重衰减
+        eps:           数值安全常数
     """
 
     def __init__(self, beta: float = 10.0, gamma: float = 2.0,
-                 eps: float = 1e-6):
+                 edge_ceiling: float = 0.3, eps: float = 1e-6):
         super().__init__()
         self.beta = beta
         self.gamma = gamma
+        self.edge_ceiling = edge_ceiling
         self.eps = eps
 
         scharr = torch.tensor([[-3., 0., 3.],
@@ -820,16 +857,21 @@ class MacroscopicTurningPointLoss(nn.Module):
         self.register_buffer('g_kernel', g_kernel.view(1, 1, 11, 11))
 
     def _macroscopic_corner_map(self, x: torch.Tensor) -> torch.Tensor:
-        """宏观角点响应图 C ∈ [0, 1] (空洞Scharr + 11×11高斯积分)."""
-        gray = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+        """宏观角点响应图 C ∈ [0, 1] (Di Zenzo 彩色结构张量 + 空洞Scharr + 11×11高斯积分).
 
-        gray_pad = F.pad(gray, (2, 2, 2, 2), mode='reflect')
-        Ix = F.conv2d(gray_pad, self.kx, dilation=2)
-        Iy = F.conv2d(gray_pad, self.ky, dilation=2)
+        使用 Di Zenzo 彩色结构张量: S = Σ_c ∇I_c ⊗ ∇I_c,
+        在色彩空间中检测角点/转折, 避免灰度对纯色相过渡 (红→蓝) 盲目。
+        """
+        B, C_ch, H, W = x.shape
+        x_flat = x.reshape(B * C_ch, 1, H, W)
+        x_pad = F.pad(x_flat, (2, 2, 2, 2), mode='reflect')
+        Ix = F.conv2d(x_pad, self.kx, dilation=2).view(B, C_ch, H, W)
+        Iy = F.conv2d(x_pad, self.ky, dilation=2).view(B, C_ch, H, W)
 
-        Ixx = Ix * Ix
-        Iyy = Iy * Iy
-        Ixy = Ix * Iy
+        # Di Zenzo: 跨通道求和外积
+        Ixx = (Ix * Ix).sum(dim=1, keepdim=True)
+        Iyy = (Iy * Iy).sum(dim=1, keepdim=True)
+        Ixy = (Ix * Iy).sum(dim=1, keepdim=True)
 
         pad_g = (5, 5, 5, 5)
         Sxx = F.conv2d(F.pad(Ixx, pad_g, mode='reflect'), self.g_kernel)
@@ -845,7 +887,21 @@ class MacroscopicTurningPointLoss(nn.Module):
         C_pred = self._macroscopic_corner_map(pred)
         with torch.no_grad():
             C_gt = self._macroscopic_corner_map(target)
-            W_gt = 1.0 + self.beta * C_gt
+
+            # 极端硬边缘抑制 (Di Zenzo 彩色梯度幅值):
+            # RGB 逐通道求梯度, 取均方根幅值, 保持与灰度版相同量纲
+            # 但不再对纯色相过渡盲目
+            B_n, C_ch, H_n, W_n = target.shape
+            t_flat = target.reshape(B_n * C_ch, 1, H_n, W_n)
+            g_pad = F.pad(t_flat, (2, 2, 2, 2), mode='reflect')
+            gx = F.conv2d(g_pad, self.kx, dilation=2).view(B_n, C_ch, H_n, W_n)
+            gy = F.conv2d(g_pad, self.ky, dilation=2).view(B_n, C_ch, H_n, W_n)
+            grad_mag = torch.sqrt(
+                (gx ** 2 + gy ** 2).mean(dim=1, keepdim=True) + self.eps)
+            edge_suppress = 1.0 - torch.sigmoid(
+                (grad_mag - self.edge_ceiling) * 20.0)
+
+            W_gt = 1.0 + self.beta * C_gt * edge_suppress
 
         loss_weighted_l1 = (W_gt * torch.abs(pred - target)).mean()
 
@@ -879,17 +935,21 @@ class LaplacianResonanceTopologyLoss(nn.Module):
         resonance_threshold: 拉普拉斯能量阈值, 分离单源边缘与双源共振 (默认 1.5)
         intensity_weight:    Charbonnier 强度项权重 (默认 0.15)
         intensity_eps:       Charbonnier 饱和常数, 单位与 Laplacian 能量相同 (默认 2.0)
+        energy_ceiling:      拉普拉斯能量软天花板 (默认 5.0)
+                             超过此值的极端硬边缘 (动漫 255→0 画笔) 掩码衰减,
+                             与 resonance_threshold 形成带通: 仅夹缝/交汇区激活
         eps:                 数值安全常数
     """
 
     def __init__(self, patch_size: int = 5, resonance_threshold: float = 1.5,
                  intensity_weight: float = 0.15, intensity_eps: float = 2.0,
-                 eps: float = 1e-4):
+                 energy_ceiling: float = 5.0, eps: float = 1e-4):
         super().__init__()
         self.patch_size = patch_size
         self.resonance_threshold = resonance_threshold
         self.intensity_weight = intensity_weight
         self.intensity_eps = intensity_eps
+        self.energy_ceiling = energy_ceiling
         self.eps = eps
 
         laplacian = torch.tensor([[ 1.,  1.,  1.],
@@ -922,6 +982,11 @@ class LaplacianResonanceTopologyLoss(nn.Module):
         with torch.no_grad():
             target_energy = self._compute_multiscale_energy(target)
             mask = torch.sigmoid((target_energy - self.resonance_threshold) * 10.0)
+            # 带通天花板: 抑制极端硬边缘 (energy >> ceiling),
+            # 仅保留夹缝/交汇区 (中等能量) 的有效惩罚
+            ceiling_suppress = 1.0 - torch.sigmoid(
+                (target_energy - self.energy_ceiling) * 5.0)
+            mask = mask * ceiling_suppress
             mask = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
             if mask.sum() < 1.0:
                 return pred.sum() * 0.0
@@ -1300,22 +1365,38 @@ class DecoupledGANLoss(nn.Module):
 
 
 class CaelumLossV2(nn.Module):
-    """Combined Loss with 2-Phase Progressive Training (2 阶段渐进组合损失).
+    """Combined Loss with 3-Phase Progressive Training (3 阶段渐进组合损失).
 
     所有子损失输出原始未加权值, 权重乘法在 forward() 统一完成。
     self.weights 是公开 dict, 训练循环可随时修改。
     返回 dict: 'total' 为加权总和 (tensor), 其余为原始值 (.item() float)。
 
-    Phase 1 (0% ~ phase_2_start): l1, dc, oklch, stgv, smooth_grad_hessian
-    Phase 2
-        gibbs, angular, turning_point, lrt, perceptual
+    v1.4 变更 (vs v1.3):
+      - Crevice + LRT 从 Phase 2 提前到 Phase 1 (CMW 早期驱动)
+      - 新增 Phase 1.5 余弦渐入: Angular, TP, ChromaGrad, Gibbs
+      - L1/DC 权重余弦退火 (前 20% 全量 → 训练末 30%/40% 底线)
+      - Histogram 权重默认 0 (保留模块, 需要时手动开启)
+      - StrictFlatTGV 默认 flat_threshold 降至 0.005 (H7 强化)
+      - STGV 默认权重 3.0 (H7 强化)
+      - AdaptiveDCAnchorLoss 引入 Charbonnier (消除极限环振荡)
+
+    Phase 1  (0% ~ phase_15_start):
+        L1(退火), DC(退火), OKLCH, STGV, SGH, Crevice, LRT
+    Phase 1.5 (phase_15_start ~ phase_2_start, 余弦渐入):
+        + ChromaGrad, Gibbs, Angular, TurningPoint
+    Phase 2  (phase_2_start ~ 100%):
+        + Perceptual, Histogram (如果权重>0)
 
     Args:
         weights:            损失权重字典 (覆盖 DEFAULT_WEIGHTS)
-        phase_2_start:      Phase 2 启用阈值 (训练进度)
+        phase_15_start:     Phase 1.5 余弦渐入起点 (默认 0.15)
+        phase_2_start:      Phase 2 启用阈值 (默认 0.30)
+        l1_decay_floor:     L1 退火底线 (默认 0.3, 即最低保留 30%)
+        dc_decay_floor:     DC 退火底线 (默认 0.4, 即最低保留 40%)
+        decay_warmup:       退火 warmup 终点 (默认 0.2, 前 20% 不退火)
         oklch_alpha/beta:   OKLCH 内部权重
         stgv_alpha1/alpha2: StrictFlatTGV 变分权重
-        stgv_flat_threshold: 绝对平坦梯度幅值上限
+        stgv_flat_threshold: 绝对平坦梯度幅值上限 (H7: 0.005)
         stgv_safe_margin:   形态学隔离带大小
         angular_threshold:  线条方向损失梯度幅值激活阈值
         tp_beta/gamma:      转折点 L1 放大倍数 / 弯曲能量权重
@@ -1326,31 +1407,38 @@ class CaelumLossV2(nn.Module):
         'l1':           1.0,
         'dc':           1.0,
         'oklch':        5.0,
-        'stgv':         1.0,
-        'chroma_grad':  1.5,
-        'crevice':      6.0,
-        'histogram':    1.5,
-        'gibbs':        4.0,
+        'stgv':         3.0,           # 1.0→3.0 (H7 强化)
         'smooth_grad_hessian': 1.5,
-        'angular':      5.0,
-        'turning_point': 1.0,
-        'lrt':          1.5,
-        'perceptual':   0.5,
+        'crevice':      6.0,           # Phase 1 → 从第 1 步启用
+        'lrt':          0.2,           # Phase 1 → 从第 1 步启用
+        'chroma_grad':  1.5,           # Phase 1.5 → 余弦渐入
+        'gibbs':        4.0,           # Phase 1.5 → 余弦渐入
+        'angular':      5.0,           # Phase 1.5 → 余弦渐入
+        'turning_point': 1.0,          # Phase 1.5 → 余弦渐入
+        'histogram':    0.0,           # 默认关闭, 需要时手动开启
+        'perceptual':   0.5,           # Phase 2 → 最晚启用
     }
 
     def __init__(
         self,
         weights: dict = None,
+        phase_15_start: float = 0.15,
         phase_2_start: float = 0.3,
+        l1_decay_floor: float = 0.3,
+        dc_decay_floor: float = 0.4,
+        decay_warmup: float = 0.2,
         oklch_alpha: float = 1.0,
         oklch_beta: float = 3.0,
         stgv_alpha1: float = 1.0,
         stgv_alpha2: float = 2.0,
-        stgv_flat_threshold: float = 0.01,
+        stgv_flat_threshold: float = 0.005,
         stgv_safe_margin: int = 3,
         angular_threshold: float = 0.05,
+        angular_edge_ceiling: float = 0.3,
         tp_beta: float = 10.0,
         tp_gamma: float = 2.0,
+        tp_edge_ceiling: float = 0.3,
+        lrt_energy_ceiling: float = 5.0,
         perceptual_layers: dict = None,
     ):
         super().__init__()
@@ -1359,27 +1447,34 @@ class CaelumLossV2(nn.Module):
         if weights is not None:
             self.weights.update(weights)
 
+        self.phase_15_start = phase_15_start
         self.phase_2_start = phase_2_start
+        self.l1_decay_floor = l1_decay_floor
+        self.dc_decay_floor = dc_decay_floor
+        self.decay_warmup = decay_warmup
         self._progress = 0.0
 
-        # === Phase 1 ===
+        # === Phase 1 (始终活跃) ===
         self.l1_loss = nn.L1Loss()
         self.flat_loss = AdaptiveDCAnchorLoss()
         self.oklch_loss = OklchColorLoss(oklch_alpha, oklch_beta)
         self.stgv_loss = StrictFlatTGVLoss(stgv_alpha1, stgv_alpha2,
                                               stgv_flat_threshold, stgv_safe_margin)
         self.smooth_grad_hessian_loss = SmoothGradientHessianLoss()
+        self.crevice_loss = CreviceColorLoss()
+        self.lrt_loss = LaplacianResonanceTopologyLoss(
+            energy_ceiling=lrt_energy_ceiling)
+
+        # === Phase 1.5 (余弦渐入) ===
+        self.chroma_grad_loss = ChromaGradientLoss()
+        self.gibbs_loss = GibbsRingingPenaltySWT()
+        self.angular_loss = AngularFluencyLoss(angular_threshold,
+                                                    angular_edge_ceiling)
+        self.turning_point_loss = MacroscopicTurningPointLoss(
+            tp_beta, tp_gamma, edge_ceiling=tp_edge_ceiling)
 
         # === Phase 2 ===
-        self.chroma_grad_loss = ChromaGradientLoss()
-        self.crevice_loss = CreviceColorLoss()
         self.histogram_loss = MaskedAsymmetricHistogramLoss()
-        self.gibbs_loss = GibbsRingingPenaltySWT()
-        self.angular_loss = AngularFluencyLoss(angular_threshold)
-        self.turning_point_loss = MacroscopicTurningPointLoss(tp_beta, tp_gamma)
-
-        self.lrt_loss = LaplacianResonanceTopologyLoss()
-
         self.perceptual_loss = None
         if self.weights.get('perceptual', 0) > 0:
             self.perceptual_loss = AnimePerceptualLossV2(perceptual_layers)
@@ -1388,46 +1483,81 @@ class CaelumLossV2(nn.Module):
         self._progress = max(0.0, min(1.0, progress))
 
     def get_phase(self) -> int:
-        return 2 if self._progress >= self.phase_2_start else 1
+        if self._progress >= self.phase_2_start:
+            return 2
+        if self._progress >= self.phase_15_start:
+            return 15  # Phase 1.5
+        return 1
+
+    @staticmethod
+    def _cos_anneal(progress: float, warmup_end: float, decay_end: float) -> float:
+        """Cosine annealing: 1.0 (during warmup) → 0.0 (at decay_end)."""
+        if progress <= warmup_end:
+            return 1.0
+        if progress >= decay_end:
+            return 0.0
+        t = (progress - warmup_end) / max(decay_end - warmup_end, 1e-8)
+        return 0.5 * (1.0 + math.cos(math.pi * t))
+
+    @staticmethod
+    def _smooth_onset(progress: float, start: float, end: float) -> float:
+        """Smooth onset: 0.0 (before start) → cosine ramp → 1.0 (after end)."""
+        if progress <= start:
+            return 0.0
+        if progress >= end:
+            return 1.0
+        t = (progress - start) / max(end - start, 1e-8)
+        return 0.5 * (1.0 - math.cos(math.pi * t))
 
     def forward(self, pred: torch.Tensor,
                 target: torch.Tensor) -> dict:
         w = self.weights
-        phase = self.get_phase()
+        p = self._progress
         zero = 0.0
 
+        # ── Phase 1: 始终活跃 ──
         raw_l1 = self.l1_loss(pred, target)
         raw_flat = self.flat_loss(pred, target)
         raw_oklch = self.oklch_loss(pred, target)
         raw_stgv = self.stgv_loss(pred, target)
         raw_sgh = self.smooth_grad_hessian_loss(pred, target)
+        raw_crv = self.crevice_loss(pred, target)
+        raw_lrt = self.lrt_loss(pred, target)
 
-        total = (w['l1'] * raw_l1
-                 + w['dc'] * raw_flat
+        # L1/DC 余弦退火 (前 warmup 全量, 之后衰减到 floor)
+        l1_scale = self.l1_decay_floor + (1.0 - self.l1_decay_floor) * \
+            self._cos_anneal(p, self.decay_warmup, 1.0)
+        dc_scale = self.dc_decay_floor + (1.0 - self.dc_decay_floor) * \
+            self._cos_anneal(p, self.decay_warmup, 1.0)
+
+        total = (w['l1'] * l1_scale * raw_l1
+                 + w['dc'] * dc_scale * raw_flat
                  + w['oklch'] * raw_oklch
                  + w['stgv'] * raw_stgv
-                 + w['smooth_grad_hessian'] * raw_sgh)
+                 + w['smooth_grad_hessian'] * raw_sgh
+                 + w['crevice'] * raw_crv
+                 + w['lrt'] * raw_lrt)
 
-        raw_cg = raw_crv = raw_hist = zero
-        raw_gibbs = raw_angular = raw_tp = raw_lrt = raw_perc = zero
-
-        if phase >= 2:
-            raw_cg = self.chroma_grad_loss(pred, target)
-            raw_crv = self.crevice_loss(pred, target)
-            raw_hist = self.histogram_loss(pred, target)
-            raw_gibbs = self.gibbs_loss(pred, target)
+        # ── Phase 1.5: 余弦渐入 ──
+        phase15_blend = self._smooth_onset(p, self.phase_15_start, self.phase_2_start)
+        raw_cg = raw_gibbs = raw_angular = raw_tp = zero
+        if phase15_blend > 0:
+            raw_cg      = self.chroma_grad_loss(pred, target)
+            raw_gibbs   = self.gibbs_loss(pred, target)
             raw_angular = self.angular_loss(pred, target)
-            raw_tp  = self.turning_point_loss(pred, target)
-            raw_lrt = self.lrt_loss(pred, target)
+            raw_tp      = self.turning_point_loss(pred, target)
+            total = total + phase15_blend * (
+                w['chroma_grad'] * raw_cg
+                + w['gibbs'] * raw_gibbs
+                + w['angular'] * raw_angular
+                + w['turning_point'] * raw_tp)
 
-            total = total + (w['chroma_grad'] * raw_cg
-                             + w['crevice'] * raw_crv
-                             + w['histogram'] * raw_hist
-                             + w['gibbs'] * raw_gibbs
-                             + w['angular'] * raw_angular
-                             + w['turning_point'] * raw_tp
-                             + w['lrt'] * raw_lrt)
-
+        # ── Phase 2: Perceptual + Histogram (如果权重>0) ──
+        raw_hist = raw_perc = zero
+        if p >= self.phase_2_start:
+            if w.get('histogram', 0) > 0:
+                raw_hist = self.histogram_loss(pred, target)
+                total = total + w['histogram'] * raw_hist
             if self.perceptual_loss is not None:
                 raw_perc = self.perceptual_loss(pred, target)
                 total = total + w['perceptual'] * raw_perc
@@ -1442,14 +1572,17 @@ class CaelumLossV2(nn.Module):
             'oklch': _v(raw_oklch),
             'stgv': _v(raw_stgv),
             'smooth_grad_hessian': _v(raw_sgh),
-            'chroma_grad': _v(raw_cg),
             'crevice': _v(raw_crv),
+            'lrt': _v(raw_lrt),
+            'chroma_grad': _v(raw_cg),
             'histogram': _v(raw_hist),
             'gibbs': _v(raw_gibbs),
             'angular': _v(raw_angular),
             'turning_point': _v(raw_tp),
-            'lrt': _v(raw_lrt),
             'perceptual': _v(raw_perc),
+            'l1_scale': l1_scale,
+            'dc_scale': dc_scale,
+            'phase15_blend': phase15_blend,
         }
 
 
@@ -1642,36 +1775,3 @@ if __name__ == "__main__":
     else:
         print("\n■ AnimePerceptualLossV2: 跳过 (缺少 timm)")
 
-    print("\n■ CaelumLossV2:")
-    v2_weights = dict(CaelumLossV2.DEFAULT_WEIGHTS)
-    v2_weights['perceptual'] = 0.0
-    criterion = CaelumLossV2(weights=v2_weights).to(device)
-    v2_pred = torch.randn(2, 3, 64, 64, device=device).clamp(0, 1).requires_grad_(True)
-    v2_target = torch.randn(2, 3, 64, 64, device=device).clamp(0, 1)
-
-    criterion.set_progress(0.0)
-    out1 = criterion(v2_pred, v2_target)
-    out1['total'].backward()
-    print(f"  Phase 1: total={out1['total'].item():.4f} "
-          f"l1={out1['l1']:.4f} dc={out1['dc']:.4f} "
-          f"oklch={out1['oklch']:.4f} stgv={out1['stgv']:.4f} "
-          f"sgh={out1['smooth_grad_hessian']:.4f}")
-    print(f"           chroma_grad={out1['chroma_grad']} (应=0.0)")
-    v2_pred.grad.zero_()
-
-    criterion.set_progress(0.5)
-    out2 = criterion(v2_pred, v2_target)
-    out2['total'].backward()
-    print(f"  Phase 2: total={out2['total'].item():.4f} "
-          f"gibbs={out2['gibbs']:.4f} "
-          f"angular={out2['angular']:.4f} "
-          f"tp={out2['turning_point']:.4f} "
-          f"lrt={out2['lrt']:.4f} cg={out2['chroma_grad']:.4f}")
-    v2_pred.grad.zero_()
-
-    criterion.weights['l1'] = 0.0
-    out3 = criterion(v2_pred, v2_target)
-    print(f"  权重修改: l1 weight=0, raw l1={out3['l1']:.4f}")
-    print(f"  默认权重: {CaelumLossV2.DEFAULT_WEIGHTS}")
-
-    print("\n" + "=" * 60)
