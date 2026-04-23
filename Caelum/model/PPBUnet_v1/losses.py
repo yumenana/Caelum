@@ -62,6 +62,7 @@ Components:
 """
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -171,13 +172,15 @@ class AdaptiveDCAnchorLoss(nn.Module):
 
     def __init__(self, flat_weight: float = 10.0, detail_weight: float = 1.0,
                  decay_gamma: float = 50.0, charb_eps: float = 1.0 / 255.0,
-                 eps: float = 1e-6):
+                 eps: float = 1e-4):
         super().__init__()
         self.flat_weight = flat_weight
         self.detail_weight = detail_weight
         self.decay_gamma = decay_gamma
-        self.charb_eps_sq = charb_eps ** 2
-        self.charb_eps = charb_eps
+        # FP16 安全防范: 确保 eps_sq >= 1e-4, 否则 FTZ 模式下会下溢到 0 导致梯度 NaN
+        safe_charb_eps = max(charb_eps, 1e-2)
+        self.charb_eps_sq = safe_charb_eps ** 2
+        self.charb_eps = safe_charb_eps
         self.eps = eps
 
         scharr_x = torch.tensor([[-3., 0., 3.],
@@ -237,8 +240,8 @@ class OklchColorLoss(nn.Module):
         p_a, p_b = pred_lab[:, 1:2], pred_lab[:, 2:3]
         t_a, t_b = target_lab[:, 1:2], target_lab[:, 2:3]
 
-        C_pred = (p_a ** 2 + p_b ** 2 + 1e-12).sqrt()
-        C_gt = (t_a ** 2 + t_b ** 2 + 1e-12).sqrt()
+        C_pred = (p_a ** 2 + p_b ** 2 + 1e-4).sqrt()
+        C_gt = (t_a ** 2 + t_b ** 2 + 1e-4).sqrt()
 
         chroma_loss = torch.abs(C_pred - C_gt).mean()
 
@@ -364,8 +367,8 @@ class CreviceColorLoss(nn.Module):
         p_a, p_b = pred_lab[:, 1:2], pred_lab[:, 2:3]
         t_a, t_b = target_lab[:, 1:2], target_lab[:, 2:3]
 
-        C_pred = (p_a ** 2 + p_b ** 2 + 1e-12).sqrt()
-        C_gt = (t_a ** 2 + t_b ** 2 + 1e-12).sqrt()
+        C_pred = (p_a ** 2 + p_b ** 2 + 1e-4).sqrt()
+        C_gt = (t_a ** 2 + t_b ** 2 + 1e-4).sqrt()
 
         chroma_loss = (torch.abs(C_pred - C_gt) * crevice_mask).sum() / mask_sum
 
@@ -419,7 +422,7 @@ class MaskedAsymmetricHistogramLoss(nn.Module):
         x_pad = F.pad(x, (1, 1, 1, 1), mode='reflect')
         gx = F.conv2d(x_pad, self.sobel_x, groups=3)
         gy = F.conv2d(x_pad, self.sobel_y, groups=3)
-        grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-8).max(dim=1, keepdim=True)[0]
+        grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-4).max(dim=1, keepdim=True)[0]
         core_edge = (grad_mag > 0.05).float()
         kernel_size = self.mask_dilation * 2 + 1
         dilated_mask = F.max_pool2d(core_edge, kernel_size=kernel_size,
@@ -704,7 +707,8 @@ class StrictFlatTGVLoss(nn.Module):
         self.register_buffer('kxy', kernel_dxy)
 
     def _charbonnier(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sqrt(x ** 2 + self.eps_sq)
+        # 使用 1e-4 替代 eps_sq (1e-8)，因为 1e-8 会在 FP16 中下溢出为 0.0，导致梯度 NaN
+        return torch.sqrt(x ** 2 + 1e-4)
 
     def _compute_grads_direct(self, x: torch.Tensor):
         B, C, H, W = x.shape
@@ -786,25 +790,31 @@ class AngularFluencyLoss(nn.Module):
         return gx, gy
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        p_gx, p_gy = self._get_gradients(pred)
-        with torch.no_grad():
-            t_gx, t_gy = self._get_gradients(target)
-            t_mag = torch.sqrt(t_gx ** 2 + t_gy ** 2 + self.eps)
-            low_gate = torch.sigmoid((t_mag - self.threshold) * 500.0)
-            high_gate = 1.0 - torch.sigmoid(
-                (t_mag - self.edge_ceiling) * 20.0)
-            mask = low_gate * high_gate
-            t_dir_x = t_gx / t_mag
-            t_dir_y = t_gy / t_mag
+        # 强制 FP32: p_dir = p_gx / sqrt(gx²+gy²+eps) 的反向梯度
+        # 包含 eps/(gx²+gy²+eps)^(3/2), 在 FP16 近零梯度区域溢出.
+        with torch.cuda.amp.autocast(enabled=False):
+            pred_f = pred.float()
+            target_f = target.float()
 
-        p_mag = torch.sqrt(p_gx ** 2 + p_gy ** 2 + self.eps)
-        p_dir_x = p_gx / p_mag
-        p_dir_y = p_gy / p_mag
+            p_gx, p_gy = self._get_gradients(pred_f)
+            with torch.no_grad():
+                t_gx, t_gy = self._get_gradients(target_f)
+                t_mag = torch.sqrt(t_gx ** 2 + t_gy ** 2 + self.eps)
+                low_gate = torch.sigmoid((t_mag - self.threshold) * 500.0)
+                high_gate = 1.0 - torch.sigmoid(
+                    (t_mag - self.edge_ceiling) * 20.0)
+                mask = low_gate * high_gate
+                t_dir_x = t_gx / t_mag
+                t_dir_y = t_gy / t_mag
 
-        cos_sim = p_dir_x * t_dir_x + p_dir_y * t_dir_y
-        angular_dist = 1.0 - cos_sim
+            p_mag = torch.sqrt(p_gx ** 2 + p_gy ** 2 + self.eps)
+            p_dir_x = p_gx / p_mag
+            p_dir_y = p_gy / p_mag
 
-        return (angular_dist * mask).mean()
+            cos_sim = p_dir_x * t_dir_x + p_dir_y * t_dir_y
+            angular_dist = 1.0 - cos_sim
+
+            return (angular_dist * mask).mean()
 
 
 class MacroscopicTurningPointLoss(nn.Module):
@@ -837,7 +847,7 @@ class MacroscopicTurningPointLoss(nn.Module):
     """
 
     def __init__(self, beta: float = 10.0, gamma: float = 2.0,
-                 edge_ceiling: float = 0.3, eps: float = 1e-6):
+                 edge_ceiling: float = 0.3, eps: float = 1e-4):
         super().__init__()
         self.beta = beta
         self.gamma = gamma
@@ -884,30 +894,36 @@ class MacroscopicTurningPointLoss(nn.Module):
         return torch.clamp(C, 0.0, 1.0)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        C_pred = self._macroscopic_corner_map(pred)
-        with torch.no_grad():
-            C_gt = self._macroscopic_corner_map(target)
+        # 强制 FP32: _macroscopic_corner_map 中 C = 4*det/(trace²+eps) 的反向梯度
+        # 包含 1/(trace²+eps)², 在 FP16 平坦区域会溢出导致间歇性 NaN.
+        with torch.cuda.amp.autocast(enabled=False):
+            pred_f = pred.float()
+            target_f = target.float()
 
-            # 极端硬边缘抑制 (Di Zenzo 彩色梯度幅值):
-            # RGB 逐通道求梯度, 取均方根幅值, 保持与灰度版相同量纲
-            # 但不再对纯色相过渡盲目
-            B_n, C_ch, H_n, W_n = target.shape
-            t_flat = target.reshape(B_n * C_ch, 1, H_n, W_n)
-            g_pad = F.pad(t_flat, (2, 2, 2, 2), mode='reflect')
-            gx = F.conv2d(g_pad, self.kx, dilation=2).view(B_n, C_ch, H_n, W_n)
-            gy = F.conv2d(g_pad, self.ky, dilation=2).view(B_n, C_ch, H_n, W_n)
-            grad_mag = torch.sqrt(
-                (gx ** 2 + gy ** 2).mean(dim=1, keepdim=True) + self.eps)
-            edge_suppress = 1.0 - torch.sigmoid(
-                (grad_mag - self.edge_ceiling) * 20.0)
+            C_pred = self._macroscopic_corner_map(pred_f)
+            with torch.no_grad():
+                C_gt = self._macroscopic_corner_map(target_f)
 
-            W_gt = 1.0 + self.beta * C_gt * edge_suppress
+                # 极端硬边缘抑制 (Di Zenzo 彩色梯度幅值):
+                # RGB 逐通道求梯度, 取均方根幅值, 保持与灰度版相同量纲
+                # 但不再对纯色相过渡盲目
+                B_n, C_ch, H_n, W_n = target_f.shape
+                t_flat = target_f.reshape(B_n * C_ch, 1, H_n, W_n)
+                g_pad = F.pad(t_flat, (2, 2, 2, 2), mode='reflect')
+                gx = F.conv2d(g_pad, self.kx, dilation=2).view(B_n, C_ch, H_n, W_n)
+                gy = F.conv2d(g_pad, self.ky, dilation=2).view(B_n, C_ch, H_n, W_n)
+                grad_mag = torch.sqrt(
+                    (gx ** 2 + gy ** 2).mean(dim=1, keepdim=True) + self.eps)
+                edge_suppress = 1.0 - torch.sigmoid(
+                    (grad_mag - self.edge_ceiling) * 20.0)
 
-        loss_weighted_l1 = (W_gt * torch.abs(pred - target)).mean()
+                W_gt = 1.0 + self.beta * C_gt * edge_suppress
 
-        loss_bending = F.mse_loss(C_pred, C_gt)
+            loss_weighted_l1 = (W_gt * torch.abs(pred_f - target_f)).mean()
 
-        return loss_weighted_l1 + self.gamma * loss_bending
+            loss_bending = F.mse_loss(C_pred, C_gt)
+
+            return loss_weighted_l1 + self.gamma * loss_bending
 
 
 class LaplacianResonanceTopologyLoss(nn.Module):
@@ -1009,7 +1025,7 @@ class LaplacianResonanceTopologyLoss(nn.Module):
         # 强度项: Charbonnier 饱和拉普拉斯能量差
         pred_energy    = self._compute_multiscale_energy(pred)
         diff           = pred_energy - target_energy
-        charb          = torch.sqrt(diff ** 2 + self.intensity_eps ** 2) - self.intensity_eps
+        charb          = torch.sqrt(diff ** 2 + max(self.intensity_eps ** 2, 1e-4)) - self.intensity_eps
         intensity_loss = (charb * mask).sum() / mask_sum
 
         return topo_loss + self.intensity_weight * intensity_loss
@@ -1034,7 +1050,7 @@ class SmoothGradientHessianLoss(nn.Module):
     """
 
     def __init__(self, tau_low: float = 0.001, tau_high: float = 0.05,
-                 k1: float = 100.0, k2: float = 100.0, epsilon: float = 1e-6):
+                 k1: float = 100.0, k2: float = 100.0, epsilon: float = 1e-4):
         super().__init__()
         self.tau_low = tau_low
         self.tau_high = tau_high
@@ -1530,13 +1546,24 @@ class CaelumLossV2(nn.Module):
         dc_scale = self.dc_decay_floor + (1.0 - self.dc_decay_floor) * \
             self._cos_anneal(p, self.decay_warmup, 1.0)
 
-        total = (w['l1'] * l1_scale * raw_l1
-                 + w['dc'] * dc_scale * raw_flat
-                 + w['oklch'] * raw_oklch
-                 + w['stgv'] * raw_stgv
-                 + w['smooth_grad_hessian'] * raw_sgh
-                 + w['crevice'] * raw_crv
-                 + w['lrt'] * raw_lrt)
+        # NaN 安全网: 逐子损失检查, 防止单个子损失污染 total
+        p1_terms = [
+            ('l1', l1_scale, raw_l1),
+            ('dc', dc_scale, raw_flat),
+            ('oklch', 1.0, raw_oklch),
+            ('stgv', 1.0, raw_stgv),
+            ('smooth_grad_hessian', 1.0, raw_sgh),
+            ('crevice', 1.0, raw_crv),
+            ('lrt', 1.0, raw_lrt),
+        ]
+        total = torch.zeros(1, device=pred.device, dtype=pred.dtype)
+        for name, scale, val in p1_terms:
+            if isinstance(val, torch.Tensor) and torch.isfinite(val):
+                total = total + w[name] * scale * val
+            elif isinstance(val, torch.Tensor):
+                warnings.warn(
+                    f"[CaelumLossV2] non-finite sub-loss '{name}' → skipped",
+                    RuntimeWarning, stacklevel=1)
 
         # ── Phase 1.5: 余弦渐入 ──
         phase15_blend = self._smooth_onset(p, self.phase_15_start, self.phase_2_start)
@@ -1546,11 +1573,21 @@ class CaelumLossV2(nn.Module):
             raw_gibbs   = self.gibbs_loss(pred, target)
             raw_angular = self.angular_loss(pred, target)
             raw_tp      = self.turning_point_loss(pred, target)
-            total = total + phase15_blend * (
-                w['chroma_grad'] * raw_cg
-                + w['gibbs'] * raw_gibbs
-                + w['angular'] * raw_angular
-                + w['turning_point'] * raw_tp)
+
+            # NaN 安全网: 逐子损失检查, 防止单个子损失污染 total
+            p15_terms = [
+                ('chroma_grad', raw_cg),
+                ('gibbs', raw_gibbs),
+                ('angular', raw_angular),
+                ('turning_point', raw_tp),
+            ]
+            for name, val in p15_terms:
+                if isinstance(val, torch.Tensor) and torch.isfinite(val):
+                    total = total + phase15_blend * w[name] * val
+                elif isinstance(val, torch.Tensor):
+                    warnings.warn(
+                        f"[CaelumLossV2] non-finite sub-loss '{name}' → skipped",
+                        RuntimeWarning, stacklevel=1)
 
         # ── Phase 2: Perceptual + Histogram (如果权重>0) ──
         raw_hist = raw_perc = zero

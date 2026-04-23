@@ -1,4 +1,4 @@
-﻿"""
+"""
 Supporting Modules
 =============================================================
 
@@ -44,8 +44,8 @@ class ChromaticityPaletteExtractor(nn.Module):
         B, C, H, W = x.shape
         x_flat = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
 
-        keys = F.normalize(self.key_proj(x_flat), dim=-1)
-        protos = F.normalize(self.prototypes.expand(B, -1, -1), dim=-1)
+        keys = F.normalize(self.key_proj(x_flat), dim=-1, eps=1e-4)
+        protos = F.normalize(self.prototypes.expand(B, -1, -1), dim=-1, eps=1e-4)
 
         sim = torch.bmm(keys, protos.transpose(1, 2))
         tau = self.temperature.abs().clamp(min=0.1)

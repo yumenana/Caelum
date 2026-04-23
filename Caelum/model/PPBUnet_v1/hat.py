@@ -1,4 +1,4 @@
-﻿"""
+"""
 HAT: Hybrid Attention Transformer for Anime Illustration Reconstruction
 ========================================================================
 
@@ -134,6 +134,9 @@ class WindowAttention(nn.Module):
                     + mask.unsqueeze(1).unsqueeze(0))
             attn = attn.view(-1, self.num_heads, N, N)
 
+        # FP16 安全: clamp 防止 matmul 累加溢出 → inf → softmax(inf) = NaN
+        if attn.dtype == torch.float16:
+            attn = attn.clamp(min=-65504.0, max=65504.0)
         attn = F.softmax(attn, dim=-1)
         return (attn @ v).transpose(1, 2).reshape(B_, N, C)
 
@@ -239,7 +242,11 @@ class OverlappingCrossAttention(nn.Module):
         k = k.view(-1, os_ * os_, nh, hd).transpose(1, 2)
         v = v.view(-1, os_ * os_, nh, hd).transpose(1, 2)
 
-        attn = F.softmax((q * self.scale) @ k.transpose(-2, -1), dim=-1)
+        attn_logits = (q * self.scale) @ k.transpose(-2, -1)
+        # FP16 安全: clamp 防止 matmul 累加溢出 → inf → softmax(inf) = NaN
+        if attn_logits.dtype == torch.float16:
+            attn_logits = attn_logits.clamp(min=-65504.0, max=65504.0)
+        attn = F.softmax(attn_logits, dim=-1)
         out = (attn @ v).transpose(1, 2).reshape(-1, ws * ws, C)
         out = self.out_proj(out)
 

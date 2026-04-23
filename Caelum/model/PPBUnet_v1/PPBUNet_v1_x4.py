@@ -1,5 +1,5 @@
-"""
-PPBUNet v1.4 — Palette-Painter-Brush U-Net for Anime Super-Resolution (x4)
+﻿"""
+PPBUNet v1.5 — Palette-Painter-Brush U-Net for Anime Super-Resolution (x4)
 ===========================================================================
 
 4x super-resolution network for anime illustration restoration.
@@ -10,6 +10,12 @@ Architecture — Palette . Painter . Brush
     [Palette]  Extract the global color scheme from low-frequency features
     [Painter]  Reconstruct structure via attention-driven U-Net decoding
     [Brush]    Refine fine geometry at full resolution and upsample to HR
+
+  v1.5 变更 (vs v1.4):
+    - 瓶颈层 PSMamba 替换为 HAT (训练加速 2-3×)
+      PSMamba 占 50% 参数 + 35% 训练时间 (SSM 串行), 但运行在 128×128
+      (发尖已低于 Nyquist 极限), HAT 窗口注意力提供等效全局关联且完全可并行
+    - 删除 PSMamba 依赖 (ps_mamba.py 保留但不再引用)
 
   v1.4 变更 (vs v1.3):
     - 删除 AnimeCommitteeRefiner (无功能分化驱动力, 梯度死重)
@@ -50,7 +56,7 @@ Architecture — Palette . Painter . Brush
 核心模块:
   ★ RepSRBlock: 结构重参数化 (训练多分支, 推理折叠为单 Conv)
   ★ ParallelOAM: 0°/90°/45°/135° 绝对方向基底, 消灭曼哈顿阶梯锯齿
-  ★ FrequencyRouter: 频率解耦 → DC 色彩调色盘 + AC PS-Mamba 拓扑追踪
+  ★ FrequencyRouter: 频率解耦 → DC 色彩调色盘 + AC HAT 拓扑追踪
   ★ ConnectedManifoldWormhole: 双边流形虫洞 (嵌入 Decoder L0 中间, 直接辅助监督)
   ★ CreviceAuxHead: CMW 直接拓扑监督 (训练时启用, 推理零开销)
   ★ MIM + RMA: 互信息提纯跳跃连接 (InfoNCE 已接入) + 超球面流形对齐融合
@@ -71,10 +77,8 @@ import torch.nn.functional as F
 from torchvision.ops import deform_conv2d
 
 try:
-    from .ps_mamba import PSMambaBlock
     from .hat import ResidualHybridAttentionGroup
 except ImportError:
-    from ps_mamba import PSMambaBlock
     from hat import ResidualHybridAttentionGroup
 
 
@@ -494,55 +498,63 @@ class MIMFeatureFilter(nn.Module):
 
     def forward(self, feat_enc: torch.Tensor, feat_dec: torch.Tensor):
         """返回 (提纯后特征, InfoNCE 损失)。"""
-        if feat_dec.shape[2:] != feat_enc.shape[2:]:
-            feat_dec = F.interpolate(
-                feat_dec, size=feat_enc.shape[2:],
-                mode='bilinear', align_corners=False,
-            )
+        # 强制 FP32: proj_enc 在 FP16 下对高能量特征可溢出至 inf,
+        # 导致 F.normalize(inf) = inf/inf = NaN, 污染整个网络.
+        # MIM 仅含 1×1 Conv, FP32 开销可忽略.
+        with torch.cuda.amp.autocast(enabled=False):
+            feat_enc_f = feat_enc.float()
+            feat_dec_f = feat_dec.float()
 
-        B, _, H, W = feat_enc.shape
-
-        raw_proj_enc = self.proj_enc(feat_enc)
-        z_enc = F.normalize(raw_proj_enc, dim=1)
-        z_dec = F.normalize(self.proj_dec(feat_dec), dim=1)
-
-        mi_loss = torch.zeros(1, device=feat_enc.device, dtype=feat_enc.dtype)
-        if self.training:
-            N = H * W
-            num_s = min(self.num_samples, N)
-
-            z_e = z_enc.reshape(B, -1, N)
-            z_d = z_dec.reshape(B, -1, N)
-
-            with torch.no_grad():
-                energy = raw_proj_enc.detach().pow(2).sum(dim=1, keepdim=True)
-                gx = F.conv2d(energy, self._sobel_x, padding=1)
-                gy = F.conv2d(energy, self._sobel_y, padding=1)
-                grad_mag = (gx.pow(2) + gy.pow(2)).sqrt()
-                avg_grad = grad_mag.mean(dim=0).view(-1)
-                tau = avg_grad.mean() + 0.5 * avg_grad.std()
-                struct_idx = (avg_grad > tau).nonzero(as_tuple=True)[0]
-
-            actual_num_s = min(num_s, struct_idx.numel())
-            if actual_num_s >= 16:
-                perm = torch.randperm(struct_idx.numel(), device=feat_enc.device)[:actual_num_s]
-                idx = struct_idx[perm]
-
-                z_e = z_e[:, :, idx]
-                z_d = z_d[:, :, idx]
-
-                logits = torch.bmm(z_e.transpose(1, 2), z_d) / self.temperature
-                labels = torch.arange(actual_num_s, device=logits.device)
-                labels = labels.unsqueeze(0).expand(B, -1)
-                mi_loss = F.cross_entropy(
-                    logits.reshape(-1, actual_num_s), labels.reshape(-1),
+            if feat_dec_f.shape[2:] != feat_enc_f.shape[2:]:
+                feat_dec_f = F.interpolate(
+                    feat_dec_f, size=feat_enc_f.shape[2:],
+                    mode='bilinear', align_corners=False,
                 )
 
-        shared = z_enc * z_dec
-        c_gate = self.channel_fc(self.channel_pool(shared))
-        s_gate = self.spatial_conv(shared)
+            B, _, H, W = feat_enc_f.shape
 
-        return feat_enc * c_gate * s_gate, mi_loss
+            raw_proj_enc = self.proj_enc(feat_enc_f)
+            z_enc = F.normalize(raw_proj_enc, dim=1, eps=1e-4)
+            z_dec = F.normalize(self.proj_dec(feat_dec_f), dim=1, eps=1e-4)
+
+            mi_loss = torch.zeros(1, device=feat_enc.device, dtype=torch.float32)
+            if self.training:
+                N = H * W
+                num_s = min(self.num_samples, N)
+
+                z_e = z_enc.reshape(B, -1, N)
+                z_d = z_dec.reshape(B, -1, N)
+
+                with torch.no_grad():
+                    energy = raw_proj_enc.detach().pow(2).sum(dim=1, keepdim=True)
+                    gx = F.conv2d(energy, self._sobel_x, padding=1)
+                    gy = F.conv2d(energy, self._sobel_y, padding=1)
+                    grad_mag = (gx.pow(2) + gy.pow(2)).sqrt()
+                    avg_grad = grad_mag.mean(dim=0).view(-1)
+                    tau = avg_grad.mean() + 0.5 * avg_grad.std()
+                    struct_idx = (avg_grad > tau).nonzero(as_tuple=True)[0]
+
+                actual_num_s = min(num_s, struct_idx.numel())
+                if actual_num_s >= 16:
+                    perm = torch.randperm(struct_idx.numel(), device=feat_enc.device)[:actual_num_s]
+                    idx = struct_idx[perm]
+
+                    z_e = z_e[:, :, idx]
+                    z_d = z_d[:, :, idx]
+
+                    logits = torch.bmm(z_e.transpose(1, 2), z_d) / self.temperature
+                    labels = torch.arange(actual_num_s, device=logits.device)
+                    labels = labels.unsqueeze(0).expand(B, -1)
+                    mi_loss = F.cross_entropy(
+                        logits.reshape(-1, actual_num_s), labels.reshape(-1),
+                    )
+
+            shared = z_enc * z_dec
+            c_gate = self.channel_fc(self.channel_pool(shared))
+            s_gate = self.spatial_conv(shared)
+
+            # 门控回到输入精度与 feat_enc 相乘
+            return feat_enc * c_gate.to(feat_enc.dtype) * s_gate.to(feat_enc.dtype), mi_loss
 
 
 class RiemannianManifoldAlignment(nn.Module):
@@ -587,6 +599,18 @@ class RiemannianManifoldAlignment(nn.Module):
         nn.init.zeros_(self.mag_gate[-1].weight)
         nn.init.zeros_(self.mag_gate[-1].bias)
 
+        # ============================================================
+        # 输出归一化 (新增, v1.6 结构性修复):
+        # RMA 的 r_fused = w*r_enc + (1-w)*r_dec 无界, 实测 epoch 725 时
+        # fuse_1.proj_dec 输出 absmax 高达 7.4e5. 用 GroupNorm 强制把
+        # 输出 scale 钉在 O(1), 仿射参数让网络仍能学到合适的 channel-wise
+        # scale, 但全局幅值不再失控.
+        # 注意: 这会改变特征 scale, 从老 ckpt 续训需 strict=False 并接受
+        # 短期 loss 抖动.
+        # ============================================================
+        groups = 8 if (out_dim % 8 == 0) else 1
+        self.out_norm = nn.GroupNorm(groups, out_dim, affine=True)
+
     def log_map(self, p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
         """对数映射 log_p(q): 将 q 投影到 p 的切空间 T_p(S^{n-1})。
 
@@ -611,30 +635,37 @@ class RiemannianManifoldAlignment(nn.Module):
 
     def forward(self, feat_enc: torch.Tensor,
                 feat_dec: torch.Tensor) -> torch.Tensor:
-        if feat_dec.shape[2:] != feat_enc.shape[2:]:
-            feat_dec = F.interpolate(
-                feat_dec, size=feat_enc.shape[2:],
-                mode='bilinear', align_corners=False,
+        # 强制 FP32: torch.norm 在 FP16 极易溢出 (平方时超过 256 即溢出至 inf).
+        with torch.cuda.amp.autocast(enabled=False):
+            feat_enc_f = feat_enc.float()
+            feat_dec_f = feat_dec.float()
+
+            if feat_dec_f.shape[2:] != feat_enc_f.shape[2:]:
+                feat_dec_f = F.interpolate(
+                    feat_dec_f, size=feat_enc_f.shape[2:],
+                    mode='bilinear', align_corners=False,
+                )
+
+            f_enc = self.proj_enc(feat_enc_f)
+            f_dec = self.proj_dec(feat_dec_f)
+
+            r_enc = torch.norm(f_enc, p=2, dim=1, keepdim=True).clamp(min=self.eps)
+            r_dec = torch.norm(f_dec, p=2, dim=1, keepdim=True).clamp(min=self.eps)
+            d_enc = f_enc / r_enc
+            d_dec = f_dec / r_dec
+
+            tangent_enc = self.log_map(d_dec, d_enc)
+            tangent_fused = self.tangent_fusion(
+                torch.cat([tangent_enc, d_dec], dim=1),
             )
+            d_fused = self.exp_map(d_dec, tangent_fused)
 
-        f_enc = self.proj_enc(feat_enc)
-        f_dec = self.proj_dec(feat_dec)
+            w = torch.sigmoid(self.mag_gate(torch.cat([f_enc, f_dec], dim=1)))
+            r_fused = w * r_enc + (1.0 - w) * r_dec
 
-        r_enc = torch.norm(f_enc, p=2, dim=1, keepdim=True).clamp(min=self.eps)
-        r_dec = torch.norm(f_dec, p=2, dim=1, keepdim=True).clamp(min=self.eps)
-        d_enc = f_enc / r_enc
-        d_dec = f_dec / r_dec
-
-        tangent_enc = self.log_map(d_dec, d_enc)
-        tangent_fused = self.tangent_fusion(
-            torch.cat([tangent_enc, d_dec], dim=1),
-        )
-        d_fused = self.exp_map(d_dec, tangent_fused)
-
-        w = torch.sigmoid(self.mag_gate(torch.cat([f_enc, f_dec], dim=1)))
-        r_fused = w * r_enc + (1.0 - w) * r_dec
-
-        return d_fused * r_fused
+            out = d_fused * r_fused
+            out = self.out_norm(out)  # 关键: 切断半径无界增长
+            return out.to(feat_enc.dtype)
 
 
 # ======================================================================
@@ -799,6 +830,15 @@ class BaseAnchoredDetailInjector(nn.Module):
         nn.init.zeros_(self.spatial_gate[-1].weight)
         nn.init.constant_(self.spatial_gate[-1].bias, -3.0)
 
+        # ============================================================
+        # 输出归一化 (新增, v1.6 结构性修复):
+        # latent_merged = feat_deep + gate*residual. feat_deep 来自上游
+        # decoder, 实测可达 1e10 量级, gate≈0.05 也压不住. 用 GroupNorm
+        # 把上采样器入口 scale 钉死.
+        # ============================================================
+        groups = 8 if (dim % 8 == 0) else 1
+        self.out_norm = nn.GroupNorm(groups, dim, affine=True)
+
     def forward(self, feat_deep: torch.Tensor, feat_shallow: torch.Tensor) -> torch.Tensor:
         context = torch.cat([feat_deep, feat_shallow], dim=1)
         detail_residual = self.detail_extractor(context)
@@ -806,6 +846,7 @@ class BaseAnchoredDetailInjector(nn.Module):
         gate = torch.sigmoid(self.spatial_gate(feat_deep))
 
         latent_merged = feat_deep + gate * detail_residual
+        latent_merged = self.out_norm(latent_merged)  # v1.6: 切断幅值爆炸
 
         if self.training:
             self.last_gate = gate
@@ -1055,38 +1096,38 @@ class PPBUNet(nn.Module):
         out_channels: int = 3,
         dim: int = 64,
         scale: int = 4,
-        num_ps_mamba_blocks: int = 4,
         num_hat_groups: int = 4,
         num_hat_blocks_per_group: int = 6,
+        num_bn_hat_blocks: int = 2,
         window_size: int = 8,
         num_heads: int = 4,
-        ssm_d_state: int = 16,
-        num_color_slots: int = 32,
         dict_dim: int = 64,
-        split_levels: tuple = (1, 2, 4),
         use_checkpoint: bool = True,
+        **kwargs,  # absorb legacy PSMamba params for checkpoint compat
     ):
         super().__init__()
         self.scale = scale
-        self._pad_divisor = 16
+        self._pad_divisor = 32  # BN HAT needs window_size=8 at 1/4 res → 8*4=32
 
         dim_l0 = dim
         dim_l1 = dim * 2
         dim_bn = dim * 4
 
-        bn_depth = max(num_ps_mamba_blocks, 2)
         dec_depth = max(num_hat_groups, 2)
         dec_blocks = max(num_hat_blocks_per_group, 2)
+        bn_blocks = max(num_bn_hat_blocks, 1)
 
         dec_l0_pre_depth = dec_depth // 2
         dec_l0_post_depth = dec_depth - dec_l0_pre_depth
 
-        print(f"[PPBUNet] v1.4 — Palette-Painter-Brush U-Net (Optimized)")
+        bn_heads = num_heads * 2  # BN dim=4×dim, 需要更多 heads
+
+        print(f"[PPBUNet] v1.5 — Palette-Painter-Brush U-Net (Optimized)")
         print(f"[PPBUNet] 维度: L0={dim_l0}, L1={dim_l1}, BN={dim_bn}")
-        print(f"[PPBUNet] 深度: Enc=2+2, BN(AC)={bn_depth}, Dec={dec_depth}+{dec_depth}")
+        print(f"[PPBUNet] 深度: Enc=2+2, BN(HAT)={dec_depth}×{bn_blocks}blk, Dec={dec_depth}+{dec_depth}")
         print(f"[PPBUNet] 上采样: SATUpsampler_v2 {scale}x (各向异性滤波 + 隐式多边形)")
         print(f"[PPBUNet] 旁路: ParallelOAM (0°/90°/45°/135°)")
-        print(f"[PPBUNet] 瓶颈: FreqRouter → DC/AC → PSMamba×{bn_depth}")
+        print(f"[PPBUNet] 瓶颈: FreqRouter → DC/AC → HAT(heads={bn_heads}, ws={window_size}, blocks={bn_blocks})×{dec_depth}")
         print(f"[PPBUNet] 解码: RMA + HAT(heads={num_heads}, ws={window_size}, blocks={dec_blocks}) ×{dec_depth}")
         print(f"[PPBUNet] CMW: 嵌入 Decoder L0 中间 (前{dec_l0_pre_depth}+后{dec_l0_post_depth}组 HAT, dict_dim={dict_dim})")
         print(f"[PPBUNet] 辅助: CreviceAuxHead (训练时直接监督 CMW, 推理零开销)")
@@ -1118,14 +1159,18 @@ class PPBUNet(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
         )
 
-        # === Bottleneck ===
+        # === Bottleneck (v1.5: HAT replaces PSMamba) ===
         self.freq_router = FrequencyRouter(dim_bn, kernel_size=5)
         self.cmw = ConnectedManifoldWormhole(
             query_dim=dim_l0, key_dim=dim_bn, val_dim=dim_bn, dict_dim=dict_dim,
         )
+        # v1.5: PSMamba → HAT。PSMamba 占 50% 参数且串行 (SSM), 但运行在
+        # 128×128 (发尖已低于 Nyquist)。HAT 提供等效全局关联且完全可并行。
         self.bottleneck_ac = nn.Sequential(
-            *[PSMambaBlock(dim_bn, d_state=ssm_d_state, split_levels=split_levels)
-              for _ in range(bn_depth)]
+            *[ResidualHybridAttentionGroup(
+                dim_bn, bn_heads,
+                num_blocks=bn_blocks, window_size=window_size,
+              ) for _ in range(dec_depth)]
         )
         self.bn_conv = nn.Conv2d(dim_bn, dim_bn, 3, 1, 1)
 
@@ -1174,6 +1219,16 @@ class PPBUNet(nn.Module):
         # === Upsampler ===
         self.upsampler = AdvancedUpsampler(dim_l0, out_channels, scale)
 
+        # ============================================================
+        # v1.6 守卫归一化 (NaN 根治):
+        # 实测 epoch 725 dec_l0_post → topo_dcn → badi 链路 absmax 达 1e10.
+        # 在 topo_dcn 前 + badi 前各插一个 GroupNorm, 切断幅值传播.
+        # 仿射参数让网络仍可释放 channel-wise scale, 不动主干结构和语义.
+        # ============================================================
+        norm_groups = 8 if (dim_l0 % 8 == 0) else 1
+        self.guard_norm_pre_topo = nn.GroupNorm(norm_groups, dim_l0, affine=True)
+        self.guard_norm_pre_badi = nn.GroupNorm(norm_groups, dim_l0, affine=True)
+
     def _pad(self, x: torch.Tensor):
         """反射填充, 使 H、W 被 _pad_divisor 整除。"""
         _, _, H, W = x.shape
@@ -1202,34 +1257,105 @@ class PPBUNet(nn.Module):
         feat = self.down_1(skip_l1)
 
         bn_in = feat
-        feat_dc, feat_ac = self.freq_router(feat)
-        feat_ac = self.bottleneck_ac(feat_ac)
-        feat = self.bn_conv(feat_ac) + bn_in
+        amp_dtype = feat.dtype
+        is_fp16 = (amp_dtype == torch.float16)
+        # ============================================================
+        # FP16 安全区间 0: freq_router → bottleneck_ac → bn_conv
+        # bottleneck_ac (HAT) 反向梯度链承接下游 fuse_1.proj_dec (FP32 absmax≈2e5),
+        # 实测 (epoch 721): bottleneck_ac.1.blocks.0.channel_attn.se.4.weight
+        # 出现 Inf 梯度. 把整个 bottleneck 路径放 FP32 才能彻底切断 grad 溢出.
+        # 8x8 空间, 1 个 HAT block, FP32 开销可忽略.
+        # ============================================================
+        with torch.cuda.amp.autocast(enabled=False):
+            feat32 = feat.float()
+            bn_in32 = bn_in.float()
+            feat_dc, feat_ac = self.freq_router(feat32)
+            feat_ac = self.bottleneck_ac(feat_ac)
+            feat = self.bn_conv(feat_ac) + bn_in32
+            if is_fp16:
+                feat = feat.clamp(min=-65504.0, max=65504.0)
+                feat_ac = feat_ac.clamp(min=-65504.0, max=65504.0)
+                feat_dc = feat_dc.clamp(min=-65504.0, max=65504.0)
+        feat = feat.to(amp_dtype)
+        # feat_ac / feat_dc 后面会被 cmw 用到, 保持 FP32 输出 (cmw 内部已有 autocast 保护)
 
-        skip_l1, mi_loss_l1 = self.mim_l1(skip_l1, feat)
+        # ============================================================
+        # FP16 安全区间 A: mim_l1 → fuse_1 → dec_l1 → dec_l1_conv
+        # 实测 (replay_nan_batch.py): 在 FP32 下 fuse_1.proj_dec absmax≈2.3e5,
+        # dec_l1_conv absmax≈1.5e5, 远超 FP16 上限 65504.
+        # decoder L1 在 32x32 空间, FP32 计算开销可忽略.
+        # ============================================================
+        with torch.cuda.amp.autocast(enabled=False):
+            feat32 = feat.float()
+            skip_l1_32 = skip_l1.float()
+            skip_l1_32, mi_loss_l1 = self.mim_l1(skip_l1_32, feat32)
+            feat32 = self.fuse_1(feat_enc=skip_l1_32, feat_dec=feat32)
+            dec1_in_32 = feat32
+            feat32 = self.dec_l1(feat32)
+            feat32 = self.dec_l1_conv(feat32) + dec1_in_32
+            if is_fp16:
+                feat32 = feat32.clamp(min=-65504.0, max=65504.0)
+        feat = feat32.to(amp_dtype)
 
-        feat = self.fuse_1(feat_enc=skip_l1, feat_dec=feat)
-        dec1_in = feat
-        feat = self.dec_l1(feat)
-        feat = self.dec_l1_conv(feat) + dec1_in
-
-        skip_l0, mi_loss_l0 = self.mim_l0(skip_l0, feat)
+        # ============================================================
+        # FP16 安全区间 B: mim_l0 → fuse_0
+        # fuse_0.proj_dec absmax≈1.6e5, fuse_0.mag_gate.2 absmax≈3.0e5
+        # ============================================================
+        with torch.cuda.amp.autocast(enabled=False):
+            feat32 = feat.float()
+            skip_l0_32 = skip_l0.float()
+            skip_l0_32, mi_loss_l0 = self.mim_l0(skip_l0_32, feat32)
+            feat32 = self.fuse_0(feat_enc=skip_l0_32, feat_dec=feat32)
+            if is_fp16:
+                feat32 = feat32.clamp(min=-65504.0, max=65504.0)
+        feat = feat32.to(amp_dtype)
         self.mi_loss = mi_loss_l0 + mi_loss_l1
 
-        feat = self.fuse_0(feat_enc=skip_l0, feat_dec=feat)
         dec0_in = feat
-        feat = self.dec_l0_pre(feat)
-        feat = self.cmw(feat, feat_ac, feat_dc)
+        # ============================================================
+        # FP16 安全区间 D: dec_l0_pre → cmw → aux_head → dec_l0_post
+        # 实测 (epoch 725): dec_l0_pre.0.blocks.0.conv_gate 是首炸点.
+        # fuse_0 输出 absmean≈12000 (虽然被 clamp ±65504), 进入 dec_l0_pre
+        # 的 conv_gate (并行卷积旁路, 不经过 LayerNorm) 即刻溢出.
+        # 同时观测到 dec_l0_post 末端 absmax 高达 1e10 (FP32), 必须全程 FP32.
+        # 注意: 此区域占模型计算量较大, 是性能/稳定性的折中. 长期看应:
+        #   1) 启用 weight_decay (config 当前 = 0)
+        #   2) 在 fuse_0 后加 LayerNorm 让 scale 回到 ~1
+        # ============================================================
+        with torch.cuda.amp.autocast(enabled=False):
+            feat32 = feat.float()
+            feat_ac32 = feat_ac.float() if feat_ac.dtype != torch.float32 else feat_ac
+            feat_dc32 = feat_dc.float() if feat_dc.dtype != torch.float32 else feat_dc
+            feat32 = self.dec_l0_pre(feat32)
+            feat32 = self.cmw(feat32, feat_ac32, feat_dc32)
 
-        # Auxiliary crevice supervision: 拓扑 loss 直达 CMW (训练时)
-        if self.training:
-            aux = self.aux_head(feat)
-            self.aux_sr = aux[:, :, :orig_H * self.scale, :orig_W * self.scale]
+            # Auxiliary crevice supervision: 拓扑 loss 直达 CMW (训练时)
+            if self.training:
+                aux = self.aux_head(feat32)
+                self.aux_sr = aux[:, :, :orig_H * self.scale, :orig_W * self.scale]
 
-        feat = self.dec_l0_post(feat)
-        feat = self.dec_l0_conv(feat) + dec0_in
+            feat32 = self.dec_l0_post(feat32)
+            if is_fp16:
+                feat32 = feat32.clamp(min=-65504.0, max=65504.0)
+        feat = feat32.to(amp_dtype)
+        # ============================================================
+        # FP16 安全区间 C: dec_l0_conv + 残差
+        # 残差累加点风险与 dec_l1_conv 等价, 同样上 FP32 + clamp
+        # ============================================================
+        with torch.cuda.amp.autocast(enabled=False):
+            feat32 = self.dec_l0_conv(feat.float()) + dec0_in.float()
+            if is_fp16:
+                feat32 = feat32.clamp(min=-65504.0, max=65504.0)
+        feat = feat32.to(amp_dtype)
+
+        # v1.6 守卫: 切断 dec_l0_post 末端 → topo_dcn 的幅值传播
+        feat = self.guard_norm_pre_topo(feat)
 
         feat = self.topo_dcn(feat, geom_prior)
+
+        # v1.6 守卫: 切断 topo_dcn → badi 的幅值传播
+        feat = self.guard_norm_pre_badi(feat)
+
         latent_merged = self.badi(feat_deep=feat, feat_shallow=x_shallow)
 
         out = self.upsampler(latent_merged)
@@ -1245,15 +1371,14 @@ if __name__ == "__main__":
 
     cfg = dict(
         in_channels=3, out_channels=3, dim=64, scale=4,
-        num_ps_mamba_blocks=4, num_hat_groups=4,
-        num_hat_blocks_per_group=6, window_size=8, num_heads=4,
-        ssm_d_state=16, num_color_slots=32, dict_dim=64, split_levels=(1, 2, 4),
-        use_checkpoint=True,
+        num_hat_groups=4, num_hat_blocks_per_group=6,
+        num_bn_hat_blocks=2, window_size=8, num_heads=4,
+        dict_dim=64, use_checkpoint=True,
     )
 
     model = PPBUNet(**cfg)
     print("=" * 60)
-    print("  PPBUNet v1.4 — Functional Validation")
+    print("  PPBUNet v1.5 — Functional Validation")
     print("=" * 60)
     print(f"  Trainable params : {count_params(model):,} ({count_params(model)/1e6:.2f}M)")
     print(f"  Upscale factor   : {cfg['scale']}x")
