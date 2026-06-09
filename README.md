@@ -88,15 +88,15 @@ Caelum focuses on a specific, underserved problem: **restoring anime illustratio
 
 | Web Crop | [waifu2x](https://github.com/nagadomi/waifu2x) SwinUNet noise1 ×4 | **Caelum PPBUNet** CAR1 ×4 |
 |:---:|:---:|:---:|
-| ![Web](Caelum/assets/compare1/web_src.png) | ![waifu2x](Caelum/assets/compare1/waifu2x_SwinUNet_noise1_x4.png) | ![Caelum](Caelum/assets/compare1/PPBUnet_CAR1_x4.png) |
+| <img src="Caelum/assets/compare1/web_src.png" width="240"> | <img src="Caelum/assets/compare1/waifu2x_SwinUNet_noise1_x4.png" width="240"> | <img src="Caelum/assets/compare1/PPBUnet_CAR1_x4.png" width="240"> |
 
 | Web Crop | [waifu2x](https://github.com/nagadomi/waifu2x) SwinUNet noise2 ×4 | **Caelum PPBUNet** CAR1 ×4 |
 |:---:|:---:|:---:|
-| ![Web](Caelum/assets/compare2/web_src.png) | ![waifu2x](Caelum/assets/compare2/waifu2x_SwinUNet_noise2_x4.png) | ![Caelum](Caelum/assets/compare2/PPBUnet_CAR1_x4.png) |
+| <img src="Caelum/assets/compare2/web_src.png" width="240"> | <img src="Caelum/assets/compare2/waifu2x_SwinUNet_noise2_x4.png" width="240"> | <img src="Caelum/assets/compare2/PPBUnet_CAR1_x4.png" width="240"> |
 
 | Web Crop | [waifu2x](https://github.com/nagadomi/waifu2x) SwinUNet noise3 ×4 | **Caelum PPBUNet** CAR2 ×4 |
 |:---:|:---:|:---:|
-| ![Web](Caelum/assets/compare3/web_src.png) | ![waifu2x](Caelum/assets/compare3/waifu2x_SwinUNet_noise3_x4.png) | ![Caelum](Caelum/assets/compare3/PPBUnet_CAR2_x4.png) |
+| <img src="Caelum/assets/compare3/web_src.png" width="240"> | <img src="Caelum/assets/compare3/waifu2x_SwinUNet_noise3_x4.png" width="240"> | <img src="Caelum/assets/compare3/PPBUnet_CAR2_x4.png" width="240"> |
 
 ---
 
