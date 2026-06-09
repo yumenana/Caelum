@@ -40,16 +40,14 @@ Architecture — Palette . Painter . Brush
       +-----------------------------------------------+ |         |
         |                                               |         |
       +- Decoder -------------------------------------+ |         |
-      | MIM+RMA (skip_l1) --> HAT Decoder L1          | |         |  * Painter
-      | MIM+RMA (skip_l0) --> HAT L0 前半              | |         |
+      | MIM+SkipFuse (skip_l1) --> HAT Decoder L1     | |         |  * Painter
+      | MIM+SkipFuse (skip_l0) --> HAT L0 前半         | |         |
       | CMW(feat, feat_ac, feat_dc) — 虫洞色彩注入      | |         |  * Palette
       |   [CreviceAuxHead — 训练辅助监督]               | |         |
       | HAT L0 后半 → dec_l0_conv                      | |         |
       +-----------------------------------------------+ |         |
         |                                               |         |
-      TopologyGuidedDCN (OAM-guided, local only) <------+         |  * Brush
-        |                                                         |
-      BaseAnchoredDetailInjector <-- x_shallow -------------------+
+      TopologyGuidedDCN (OAM-guided, local only) <------+        |  * Brush
         |
       SATUpsampler_v2 --> SR Output (4x)
 
@@ -59,10 +57,9 @@ Architecture — Palette . Painter . Brush
   ★ FrequencyRouter: 频率解耦 → DC 色彩调色盘 + AC HAT 拓扑追踪
   ★ ConnectedManifoldWormhole: 双边流形虫洞 (嵌入 Decoder L0 中间, 直接辅助监督)
   ★ CreviceAuxHead: CMW 直接拓扑监督 (训练时启用, 推理零开销)
-  ★ MIM + RMA: 互信息提纯跳跃连接 (InfoNCE 已接入) + 超球面流形对齐融合
+  ★ MIM + SimpleSkipFusion: 互信息提纯跳跃连接 (InfoNCE 已接入) + concat→Conv1×1→GN 融合
   ★ HAT: 混合注意力 Transformer (窗口自注意力 + OCAB)
   ★ TopologyGuidedDCN: OAM 方向感知 + 拓扑引导局部可变形卷积 (3~5px 几何精修)
-  ★ BaseAnchoredDetailInjector: 恒等锚定细节注入 (ControlNet Zero-Init)
   ★ SATUpsampler_v2: 奇异点感知拓扑上采样 (各向异性动态滤波 + 隐式多边形渲染)
 
 
@@ -130,9 +127,9 @@ class RCAB(nn.Module):
     def __init__(self, dim: int, reduction: int = 16):
         super().__init__()
         self.body = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.Conv2d(dim, dim, 3, 1, 1, padding_mode='reflect'),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.Conv2d(dim, dim, 3, 1, 1, padding_mode='reflect'),
         )
         self.ca = ChannelAttention(dim, reduction)
 
@@ -161,9 +158,11 @@ class RepSRBlock(nn.Module):
 
         if deploy:
             self.rbr_reparam = nn.Conv2d(in_channels, out_channels,
-                                         kernel_size=3, padding=1, bias=True)
+                                         kernel_size=3, padding=1, bias=True,
+                                         padding_mode='reflect')
         else:
-            self.rbr_dense = nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=True)
+            self.rbr_dense = nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=True,
+                                       padding_mode='reflect')
             self.rbr_1x1 = nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=True)
             self.has_identity = (in_channels == out_channels)
 
@@ -197,6 +196,7 @@ class RepSRBlock(nn.Module):
         self.rbr_reparam = nn.Conv2d(
             self.in_channels, self.out_channels,
             kernel_size=3, padding=1, bias=True,
+            padding_mode=self.rbr_dense.padding_mode,  # 继承 reflect/zeros
         ).to(fused_kernel.device)
         self.rbr_reparam.weight.data = fused_kernel
         self.rbr_reparam.bias.data = fused_bias
@@ -230,10 +230,13 @@ class ParallelOAM(nn.Module):
         super().__init__()
         self.dim = dim
 
+        # 注意: conv_d45/d135 在 forward 里通过 F.conv2d 直接调用,
+        # 模块的 padding_mode 不会被使用 (走 F.conv2d 的 zero pad).
+        # 此处仍标注 reflect 仅作意图标记, 实际效果以 F.conv2d 为准.
         self.conv_h = nn.Conv2d(dim, dim, kernel_size=(1, 7), padding=(0, 3),
-                                groups=dim, bias=False)
+                                groups=dim, bias=False, padding_mode='reflect')
         self.conv_v = nn.Conv2d(dim, dim, kernel_size=(7, 1), padding=(3, 0),
-                                groups=dim, bias=False)
+                                groups=dim, bias=False, padding_mode='reflect')
         self.conv_d45 = nn.Conv2d(dim, dim, kernel_size=7, padding=3,
                                   groups=dim, bias=False)
         self.conv_d135 = nn.Conv2d(dim, dim, kernel_size=7, padding=3,
@@ -257,7 +260,8 @@ class ParallelOAM(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(mid, dim * 4, bias=False),
         )
-        self.project = nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False)
+        self.project = nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False,
+                                 padding_mode='reflect')
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -305,7 +309,8 @@ class FrequencyRouter(nn.Module):
     def __init__(self, dim: int, kernel_size: int = 5):
         super().__init__()
         self.lpf = nn.Conv2d(dim, dim, kernel_size=kernel_size,
-                             padding=kernel_size // 2, groups=dim, bias=False)
+                             padding=kernel_size // 2, groups=dim, bias=False,
+                             padding_mode='reflect')
         nn.init.constant_(self.lpf.weight, 1.0 / (kernel_size ** 2))
 
     def forward(self, x: torch.Tensor) -> tuple:
@@ -481,7 +486,8 @@ class MIMFeatureFilter(nn.Module):
         nn.init.constant_(self.channel_fc[0].bias, 3.0)
 
         self.spatial_conv = nn.Sequential(
-            nn.Conv2d(hidden_dim, 1, kernel_size=7, padding=3, bias=True),
+            nn.Conv2d(hidden_dim, 1, kernel_size=7, padding=3, bias=True,
+                      padding_mode='reflect'),
             nn.Sigmoid(),
         )
         nn.init.zeros_(self.spatial_conv[0].weight)
@@ -557,115 +563,40 @@ class MIMFeatureFilter(nn.Module):
             return feat_enc * c_gate.to(feat_enc.dtype) * s_gate.to(feat_enc.dtype), mi_loss
 
 
-class RiemannianManifoldAlignment(nn.Module):
-    """Riemannian Manifold Alignment on Hypersphere (超球面黎曼流形对齐融合).
+class SimpleSkipFusion(nn.Module):
+    """Simple Skip Fusion — concat → Conv1×1 → GroupNorm.
 
-    将 Encoder 高频线稿与 Decoder 低频色彩特征投影至超球面 S^{n-1},
-    通过黎曼对数/指数映射在局部欧氏切空间完成无损对齐, 避免流形坍缩。
+    v1.7 结构简化: 替换原 'RiemannianManifoldAlignment' (RMA).
+    RMA 的径-向分解 + 切空间融合数学上优雅, 在实践中:
+      - r_fused 无界 → fuse_1.proj_dec absmax 可达 7.4e5, 需额外 GN
+      - log/exp_map + torch.norm 在 FP16 下极易溢出, 需全程 FP32 安全区
+      - 过拟合表明容量过剩, 简化有助于泛化
 
-    径-向分解 (Radius-Direction Decomposition):
-      方向 d = f/||f|| ∈ S^{n-1} 用于语义对齐,
-      幅值 r = ||f|| ∈ R+ 保留绝对色彩强度,
-      二者解耦处理后重组, 避免归一化摧毁色彩信息。
+    SR/Real-ESRGAN/SwinIR/HAT 所有成熟 SR 架构都用 concat+Conv 完成 skip
+    融合. 这里额外加 GroupNorm 以继承原 RMA out_norm 的幅值控制.
 
     参数:
-        enc_dim: Encoder 特征维度
+        enc_dim: Encoder skip 特征维度
         dec_dim: Decoder 特征维度
         out_dim: 输出维度 (默认 = enc_dim)
-        eps:     数值稳定性常数
     """
 
-    def __init__(self, enc_dim: int, dec_dim: int, out_dim: int = None,
-                 eps: float = 1e-4):
+    def __init__(self, enc_dim: int, dec_dim: int, out_dim: int | None = None):
         super().__init__()
-        self.eps = eps
         out_dim = out_dim or enc_dim
-
-        self.proj_enc = nn.Conv2d(enc_dim, out_dim, kernel_size=1, bias=False)
-        self.proj_dec = nn.Conv2d(dec_dim, out_dim, kernel_size=1, bias=False)
-
-        self.tangent_fusion = nn.Sequential(
-            nn.Conv2d(out_dim * 2, out_dim, kernel_size=1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
-        )
-
-        mid_mag = max(out_dim // 4, 4)
-        self.mag_gate = nn.Sequential(
-            nn.Conv2d(out_dim * 2, mid_mag, kernel_size=1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(mid_mag, out_dim, kernel_size=1),
-        )
-        nn.init.zeros_(self.mag_gate[-1].weight)
-        nn.init.zeros_(self.mag_gate[-1].bias)
-
-        # ============================================================
-        # 输出归一化 (新增, v1.6 结构性修复):
-        # RMA 的 r_fused = w*r_enc + (1-w)*r_dec 无界, 实测 epoch 725 时
-        # fuse_1.proj_dec 输出 absmax 高达 7.4e5. 用 GroupNorm 强制把
-        # 输出 scale 钉在 O(1), 仿射参数让网络仍能学到合适的 channel-wise
-        # scale, 但全局幅值不再失控.
-        # 注意: 这会改变特征 scale, 从老 ckpt 续训需 strict=False 并接受
-        # 短期 loss 抖动.
-        # ============================================================
+        self.fuse = nn.Conv2d(enc_dim + dec_dim, out_dim, kernel_size=1, bias=True)
         groups = 8 if (out_dim % 8 == 0) else 1
         self.out_norm = nn.GroupNorm(groups, out_dim, affine=True)
 
-    def log_map(self, p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-        """对数映射 log_p(q): 将 q 投影到 p 的切空间 T_p(S^{n-1})。
-
-        使用 atan2 替代 acos 消除 inner→±1 时的梯度爆炸 (acos 导数在 ±1 处趋于无穷)。
-        atan2(y, x) 在全域梯度有界, 天然适配 AMP float16。
-        """
-        inner = torch.sum(p * q, dim=1, keepdim=True)
-        v = q - inner * p
-        v_norm = torch.norm(v, p=2, dim=1, keepdim=True).clamp(min=self.eps)
-        theta = torch.atan2(v_norm, inner)
-        return (theta / v_norm) * v
-
-    def exp_map(self, p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """指数映射 exp_p(v): 将切向量 v 沿测地线映射回超球面。
-
-        直接 clamp v_norm 替代 torch.where 分支 (torch.where 不阻断梯度流,
-        被屏蔽分支的 inf/nan 梯度仍会反向传播导致 AMP 下权重污染)。
-        v_norm→0 时: cos(ε)·p + sin(ε)/ε·v ≈ p + v (Taylor 一阶), 数学等价。
-        """
-        v_norm = torch.norm(v, p=2, dim=1, keepdim=True).clamp(min=self.eps)
-        return torch.cos(v_norm) * p + (torch.sin(v_norm) / v_norm) * v
-
     def forward(self, feat_enc: torch.Tensor,
                 feat_dec: torch.Tensor) -> torch.Tensor:
-        # 强制 FP32: torch.norm 在 FP16 极易溢出 (平方时超过 256 即溢出至 inf).
-        with torch.cuda.amp.autocast(enabled=False):
-            feat_enc_f = feat_enc.float()
-            feat_dec_f = feat_dec.float()
-
-            if feat_dec_f.shape[2:] != feat_enc_f.shape[2:]:
-                feat_dec_f = F.interpolate(
-                    feat_dec_f, size=feat_enc_f.shape[2:],
-                    mode='bilinear', align_corners=False,
-                )
-
-            f_enc = self.proj_enc(feat_enc_f)
-            f_dec = self.proj_dec(feat_dec_f)
-
-            r_enc = torch.norm(f_enc, p=2, dim=1, keepdim=True).clamp(min=self.eps)
-            r_dec = torch.norm(f_dec, p=2, dim=1, keepdim=True).clamp(min=self.eps)
-            d_enc = f_enc / r_enc
-            d_dec = f_dec / r_dec
-
-            tangent_enc = self.log_map(d_dec, d_enc)
-            tangent_fused = self.tangent_fusion(
-                torch.cat([tangent_enc, d_dec], dim=1),
+        if feat_dec.shape[2:] != feat_enc.shape[2:]:
+            feat_dec = F.interpolate(
+                feat_dec, size=feat_enc.shape[2:],
+                mode='bilinear', align_corners=False,
             )
-            d_fused = self.exp_map(d_dec, tangent_fused)
-
-            w = torch.sigmoid(self.mag_gate(torch.cat([f_enc, f_dec], dim=1)))
-            r_fused = w * r_enc + (1.0 - w) * r_dec
-
-            out = d_fused * r_fused
-            out = self.out_norm(out)  # 关键: 切断半径无界增长
-            return out.to(feat_enc.dtype)
+        out = self.fuse(torch.cat([feat_enc, feat_dec], dim=1))
+        return self.out_norm(out)
 
 
 # ======================================================================
@@ -680,9 +611,9 @@ class DensePathExtractor(nn.Module):
     """
     def __init__(self, dim: int, growth_rate: int = 16):
         super().__init__()
-        self.conv1 = nn.Sequential(nn.Conv2d(dim, growth_rate, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True))
-        self.conv2 = nn.Sequential(nn.Conv2d(dim + growth_rate, growth_rate, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True))
-        self.conv3 = nn.Sequential(nn.Conv2d(dim + 2 * growth_rate, growth_rate, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True))
+        self.conv1 = nn.Sequential(nn.Conv2d(dim, growth_rate, 3, 1, 1, padding_mode='reflect'), nn.LeakyReLU(0.2, inplace=True))
+        self.conv2 = nn.Sequential(nn.Conv2d(dim + growth_rate, growth_rate, 3, 1, 1, padding_mode='reflect'), nn.LeakyReLU(0.2, inplace=True))
+        self.conv3 = nn.Sequential(nn.Conv2d(dim + 2 * growth_rate, growth_rate, 3, 1, 1, padding_mode='reflect'), nn.LeakyReLU(0.2, inplace=True))
         # 特征压缩融合
         self.fuse = nn.Conv2d(dim + 3 * growth_rate, dim, 1, 1, 0)
 
@@ -732,7 +663,7 @@ class TopologyGuidedDCN(nn.Module):
 
         # === 共享拓扑骨干 ===
         self.corner_prior = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, bias=False),
+            nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, bias=False, padding_mode='reflect'),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(dim, 1, 1),
             nn.Sigmoid(),
@@ -744,9 +675,9 @@ class TopologyGuidedDCN(nn.Module):
 
         # === 局部 DCN (Brush — 3~5px 几何精修) ===
         self.local_head = nn.Sequential(
-            nn.Conv2d(path_ch, dim // 2, 3, 1, 1),
+            nn.Conv2d(path_ch, dim // 2, 3, 1, 1, padding_mode='reflect'),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(dim // 2, 27, 3, 1, 1),  # 18 offset + 9 mask
+            nn.Conv2d(dim // 2, 27, 3, 1, 1, padding_mode='reflect'),  # 18 offset + 9 mask
         )
         nn.init.zeros_(self.local_head[-1].weight)
         nn.init.zeros_(self.local_head[-1].bias)
@@ -791,71 +722,6 @@ class TopologyGuidedDCN(nn.Module):
                 self.last_topo_map_mean = topo_map.mean().item()
 
         return feat
-
-
-
-
-class BaseAnchoredDetailInjector(nn.Module):
-    """
-    基础锚定细节注入器 (Base-Anchored Detail Injector - BADI).
-
-    ■ 第一性原理重构 (跳出零和博弈) ■
-    彻底抛弃 Out = a*Deep + (1-a)*Shallow 的零和门控机制，根除深层特征的"梯度断头台"效应。
-
-    采用坚不可摧的"恒等锚定 (Identity-Anchored)"法则：
-    1. 承重墙直通: 深层纯净特征 (feat_deep) 永远不乘以任何掩码，直接参与加法，
-       保证其永远受到 100% 的重建损失约束，绝无可能发生数值爆炸。
-    2. 跨层细节萃取: 联合深浅特征，提取出一个包含高频边缘的"修补残差"。
-    3. 基底主导门控: 由深层纯净语义自己决定，在什么地方 (线稿) 引入残差，
-       在什么地方 (平坦噪点区) 将残差门控归零。
-    """
-    def __init__(self, dim: int):
-        super().__init__()
-
-        self.detail_extractor = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, kernel_size=3, padding=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=True)
-        )
-
-        self.spatial_gate = nn.Sequential(
-            nn.Conv2d(dim, dim // 2, kernel_size=3, padding=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(dim // 2, 1, kernel_size=1, bias=True)
-        )
-
-        nn.init.zeros_(self.detail_extractor[-1].weight)
-        nn.init.zeros_(self.detail_extractor[-1].bias)
-
-        nn.init.zeros_(self.spatial_gate[-1].weight)
-        nn.init.constant_(self.spatial_gate[-1].bias, -3.0)
-
-        # ============================================================
-        # 输出归一化 (新增, v1.6 结构性修复):
-        # latent_merged = feat_deep + gate*residual. feat_deep 来自上游
-        # decoder, 实测可达 1e10 量级, gate≈0.05 也压不住. 用 GroupNorm
-        # 把上采样器入口 scale 钉死.
-        # ============================================================
-        groups = 8 if (dim % 8 == 0) else 1
-        self.out_norm = nn.GroupNorm(groups, dim, affine=True)
-
-    def forward(self, feat_deep: torch.Tensor, feat_shallow: torch.Tensor) -> torch.Tensor:
-        context = torch.cat([feat_deep, feat_shallow], dim=1)
-        detail_residual = self.detail_extractor(context)
-
-        gate = torch.sigmoid(self.spatial_gate(feat_deep))
-
-        latent_merged = feat_deep + gate * detail_residual
-        latent_merged = self.out_norm(latent_merged)  # v1.6: 切断幅值爆炸
-
-        if self.training:
-            self.last_gate = gate
-            with torch.no_grad():
-                self.last_gate_mean = gate.mean().item()
-                self.last_detail_mag = detail_residual.abs().mean().item()
-
-        return latent_merged
-
 
 
 # ======================================================================
@@ -977,9 +843,9 @@ class SATUpsampler_v2(nn.Module):
 
         # === 模块一: 各向异性动态滤波核生成器 (处理 C^∞ 平滑流形) ===
         self.filter_gen = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False, padding_mode='reflect'),
             nn.GELU(),
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False, padding_mode='reflect'),
             nn.GELU(),
             nn.Conv2d(dim, self.n_phases * (self.k ** 2), kernel_size=1, bias=False),
         )
@@ -1041,9 +907,9 @@ class AdvancedUpsampler(nn.Module):
             raise ValueError(f"Unsupported scale factor: {scale}")
 
         self.tail = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
             nn.GELU(),
-            nn.Conv2d(dim, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(dim, out_channels, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1128,12 +994,11 @@ class PPBUNet(nn.Module):
         print(f"[PPBUNet] 上采样: SATUpsampler_v2 {scale}x (各向异性滤波 + 隐式多边形)")
         print(f"[PPBUNet] 旁路: ParallelOAM (0°/90°/45°/135°)")
         print(f"[PPBUNet] 瓶颈: FreqRouter → DC/AC → HAT(heads={bn_heads}, ws={window_size}, blocks={bn_blocks})×{dec_depth}")
-        print(f"[PPBUNet] 解码: RMA + HAT(heads={num_heads}, ws={window_size}, blocks={dec_blocks}) ×{dec_depth}")
+        print(f"[PPBUNet] 解码: SimpleSkipFusion + HAT(heads={num_heads}, ws={window_size}, blocks={dec_blocks}) ×{dec_depth}")
         print(f"[PPBUNet] CMW: 嵌入 Decoder L0 中间 (前{dec_l0_pre_depth}+后{dec_l0_post_depth}组 HAT, dict_dim={dict_dim})")
         print(f"[PPBUNet] 辅助: CreviceAuxHead (训练时直接监督 CMW, 推理零开销)")
         print(f"[PPBUNet] 精修: TopologyGuidedDCN (OAM local)")
-        print(f"[PPBUNet] 融合: BaseAnchoredDetailInjector (Identity-Anchored)")
-        print(f"[PPBUNet] 跳连: MIM (InfoNCE) + RMA")
+        print(f"[PPBUNet] 跳连: MIM (InfoNCE) + SimpleSkipFusion (concat→Conv1×1→GN)")
 
         # === Shallow ===
         self.shallow = nn.Sequential(
@@ -1148,14 +1013,14 @@ class PPBUNet(nn.Module):
         # === Encoder L0 ===
         self.enc_l0 = nn.Sequential(*[RCAB(dim_l0) for _ in range(2)])
         self.down_0 = nn.Sequential(
-            nn.Conv2d(dim_l0, dim_l1, 3, 2, 1),
+            nn.Conv2d(dim_l0, dim_l1, 3, 2, 1, padding_mode='reflect'),
             nn.LeakyReLU(0.2, inplace=True),
         )
 
         # === Encoder L1 ===
         self.enc_l1 = nn.Sequential(*[RCAB(dim_l1) for _ in range(2)])
         self.down_1 = nn.Sequential(
-            nn.Conv2d(dim_l1, dim_bn, 3, 2, 1),
+            nn.Conv2d(dim_l1, dim_bn, 3, 2, 1, padding_mode='reflect'),
             nn.LeakyReLU(0.2, inplace=True),
         )
 
@@ -1172,24 +1037,24 @@ class PPBUNet(nn.Module):
                 num_blocks=bn_blocks, window_size=window_size,
               ) for _ in range(dec_depth)]
         )
-        self.bn_conv = nn.Conv2d(dim_bn, dim_bn, 3, 1, 1)
+        self.bn_conv = nn.Conv2d(dim_bn, dim_bn, 3, 1, 1, padding_mode='reflect')
 
         # === MIM Feature Filters ===
         self.mim_l1 = MIMFeatureFilter(enc_dim=dim_l1, dec_dim=dim_bn)
         self.mim_l0 = MIMFeatureFilter(enc_dim=dim_l0, dec_dim=dim_l1)
 
         # === Decoder L1 ===
-        self.fuse_1 = RiemannianManifoldAlignment(enc_dim=dim_l1, dec_dim=dim_bn, out_dim=dim_l1)
+        self.fuse_1 = SimpleSkipFusion(enc_dim=dim_l1, dec_dim=dim_bn, out_dim=dim_l1)
         self.dec_l1 = nn.Sequential(
             *[ResidualHybridAttentionGroup(
                 dim_l1, num_heads * 2,
                 num_blocks=max(dec_blocks // 2, 1), window_size=window_size,
               ) for _ in range(dec_depth)]
         )
-        self.dec_l1_conv = nn.Conv2d(dim_l1, dim_l1, 3, 1, 1)
+        self.dec_l1_conv = nn.Conv2d(dim_l1, dim_l1, 3, 1, 1, padding_mode='reflect')
 
         # === Decoder L0 (split for mid-decoder CMW insertion) ===
-        self.fuse_0 = RiemannianManifoldAlignment(enc_dim=dim_l0, dec_dim=dim_l1, out_dim=dim_l0)
+        self.fuse_0 = SimpleSkipFusion(enc_dim=dim_l0, dec_dim=dim_l1, out_dim=dim_l0)
         self.dec_l0_pre = nn.Sequential(
             *[ResidualHybridAttentionGroup(
                 dim_l0, num_heads,
@@ -1202,7 +1067,7 @@ class PPBUNet(nn.Module):
                 num_blocks=dec_blocks, window_size=window_size,
               ) for _ in range(dec_l0_post_depth)]
         )
-        self.dec_l0_conv = nn.Conv2d(dim_l0, dim_l0, 3, 1, 1)
+        self.dec_l0_conv = nn.Conv2d(dim_l0, dim_l0, 3, 1, 1, padding_mode='reflect')
 
         # === Topology-Guided DCN (OAM 方向感知 + 局部几何精修) ===
         self.topo_dcn = TopologyGuidedDCN(dim_l0, geom_dim=dim_l0)
@@ -1213,21 +1078,29 @@ class PPBUNet(nn.Module):
         # === Crevice Auxiliary Supervision Head (训练时直接监督 CMW, 推理零开销) ===
         self.aux_head = CreviceAuxHead(dim_l0, scale)
 
-        # === Base-Anchored Detail Injector ===
-        self.badi = BaseAnchoredDetailInjector(dim=dim_l0)
-
         # === Upsampler ===
         self.upsampler = AdvancedUpsampler(dim_l0, out_channels, scale)
 
         # ============================================================
         # v1.6 守卫归一化 (NaN 根治):
-        # 实测 epoch 725 dec_l0_post → topo_dcn → badi 链路 absmax 达 1e10.
-        # 在 topo_dcn 前 + badi 前各插一个 GroupNorm, 切断幅值传播.
+        # 实测 epoch 725 dec_l0_post → topo_dcn 链路 absmax 达 1e10.
+        # 在 topo_dcn 前插一个 GroupNorm, 切断幅值传播.
         # 仿射参数让网络仍可释放 channel-wise scale, 不动主干结构和语义.
         # ============================================================
         norm_groups = 8 if (dim_l0 % 8 == 0) else 1
         self.guard_norm_pre_topo = nn.GroupNorm(norm_groups, dim_l0, affine=True)
-        self.guard_norm_pre_badi = nn.GroupNorm(norm_groups, dim_l0, affine=True)
+
+        # ============================================================
+        # v1.7 全局 padding 修正 (修复推理上方暗带):
+        # 训练时 LR patch 总是从 HR 大图内部裁取, patch 边缘相邻的是真实
+        # 像素而非零. Conv 默认 zero-padding 在训练分布中几乎不出现于
+        # patch 边缘, 网络从未学习如何处理"边缘真的是 0"的情况.
+        # 推理时图像真实顶/底/左/右边界送入网络 → Conv zero-pad → 网络
+        # 误判为暗内容 → 边界 ~scale*4 像素偏暗 (3000ep 后尤其严重).
+        #
+        # 解决: 所有空间 Conv2d (k>1, padding>0) 在声明处显式标注
+        # padding_mode='reflect'. 注意 hat.py 等外部子模块需要单独检查.
+        # ============================================================
 
     def _pad(self, x: torch.Tensor):
         """反射填充, 使 H、W 被 _pad_divisor 整除。"""
@@ -1353,12 +1226,7 @@ class PPBUNet(nn.Module):
 
         feat = self.topo_dcn(feat, geom_prior)
 
-        # v1.6 守卫: 切断 topo_dcn → badi 的幅值传播
-        feat = self.guard_norm_pre_badi(feat)
-
-        latent_merged = self.badi(feat_deep=feat, feat_shallow=x_shallow)
-
-        out = self.upsampler(latent_merged)
+        out = self.upsampler(feat)
         return out[:, :, :orig_H * self.scale, :orig_W * self.scale]
 
 

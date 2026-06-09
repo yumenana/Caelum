@@ -151,9 +151,9 @@ class ChannelAttention(nn.Module):
         super().__init__()
         mid = max(dim // reduction, 4)
         self.body = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.Conv2d(dim, dim, 3, 1, 1, padding_mode='reflect'),
             nn.GELU(),
-            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.Conv2d(dim, dim, 3, 1, 1, padding_mode='reflect'),
         )
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -291,7 +291,7 @@ class HybridAttentionBlock(nn.Module):
         )
 
         self.channel_attn = ChannelAttention(dim)
-        self.conv_gate = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim)
+        self.conv_gate = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, padding_mode='reflect')
 
     def _create_shift_mask(self, H: int, W: int,
                            device: torch.device) -> torch.Tensor | None:
@@ -377,7 +377,7 @@ class ResidualHybridAttentionGroup(nn.Module):
             )
 
         self.ocab = OverlappingCrossAttention(dim, num_heads, window_size)
-        self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
+        self.conv = nn.Conv2d(dim, dim, 3, 1, 1, padding_mode='reflect')
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
