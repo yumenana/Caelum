@@ -1,4 +1,4 @@
-﻿**English** | [中文](README_zh.md)
+**English** | [中文](README_zh.md)
 
 <div align="center">
 
@@ -73,6 +73,7 @@ Caelum focuses on a specific, underserved problem: **restoring anime illustratio
 
 ![Caelum Demo](Caelum/assets/demo0.png)
 ![Caelum Demo](Caelum/assets/demo1.png)
+![Caelum Demo](Caelum/assets/demo2.png)
 
 </div>
 
@@ -382,6 +383,7 @@ Caelum/                            ← Repository root
 │   │   ├── logo.png               # Project logo
 │   │   ├── demo0.png              # GUI demo image
 │   │   ├── demo1.png              # GUI demo image
+│   │   ├── demo2.png              # GUI demo image
 │   │   └── compare/               # Comparison images
 │   │       ├── degradation.png
 │   │       ├── GT.png
@@ -415,17 +417,17 @@ Caelum/                            ← Repository root
 - [x] Multi-platform degradation simulation pipeline (5 modes · 3-stage high-order chain · online real-time generation)
 - [x] Custom loss function system (CaelumLossV2 · 12 sub-losses · two-phase progressive strategy)
 - [x] Early checkpoint validation
+- [x] Complete model training & update final results showcase
+- [x] Package exe + ONNX export & publish Release
+- [x] **Hair reconstruction** — Recovery of hair tips and line-crevice detail
+- [x] **Residual-free architecture exploration** — Purely attention/Mamba forward architectures free of skip-add residuals
 
 #### 🔄 In Progress
 
-- [x] Complete model training → update final results showcase
-- [ ] Package exe + ONNX export → publish Release
+- [ ] **New architecture exploration** — Building on PPBUNet experience, continuing to explore more efficient and interesting anime SR architecture directions
 
 #### 🔭 Future Plans
 
-- [ ] **Hair reconstruction** — Recovery of hair tips and line-crevice detail is the current biggest weakness; planning hair-aware perceptual loss and targeted geometry refinement modules
-- [ ] **Residual-free architecture exploration** — Skip-add residuals have a fundamental limitation in artifact suppression (harmful input information is difficult to cut off); exploring purely attention/Mamba forward architectures free of skip-add residuals
-- [ ] **New architecture exploration** — Building on PPBUNet experience, continuing to explore more efficient and interesting anime SR architecture directions
 - [ ] **Expand training dataset** — Current dataset scale and diversity remain a bottleneck; planning to incorporate larger-scale anime illustration data (Danbooru · Pixiv etc.) while researching data cleaning and quality filtering pipelines
 
 ---
